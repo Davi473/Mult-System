@@ -67,8 +67,8 @@ class KVMServer {
       });
     });
 
-    server.listen(PORT, '0.0.0.0', () => {
-      console.log(`[Servidor] Escutando conexões TCP na porta ${PORT}...`);
+    server.listen(PORT, () => {
+      console.log(`[Servidor] Escutando conexões TCP na porta ${PORT} (IPv4 e IPv6)...`);
     });
   }
 

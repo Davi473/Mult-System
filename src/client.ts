@@ -4,10 +4,20 @@ import { KVMPacket, serializePacket, UIOHOOK_TO_NUT_KEY, loadEnv } from './proto
 
 loadEnv();
 
-const SERVER_HOST = process.argv[2] || process.env.SERVER_HOST || '127.0.0.1';
+const SERVER_HOST = process.argv[2] || process.env.SERVER_HOST || 'servidor';
 const SERVER_PORT = Number(process.env.KVM_PORT) || 5000;
 // Se o Cliente está à direita do Servidor, a borda de retorno ao Servidor é a esquerda ('left')
 const RETURN_EDGE: 'left' | 'right' = (process.env.RETURN_EDGE as 'left' | 'right') || 'left';
+
+// Lista de candidatos de host/IP caso o nome DNS local falhe sem sufixo .local
+const FALLBACK_HOSTS = Array.from(
+  new Set([
+    SERVER_HOST,
+    SERVER_HOST.endsWith('.local') ? SERVER_HOST : `${SERVER_HOST}.local`,
+    '192.168.1.15',
+    '192.168.1.14',
+  ])
+);
 
 class KVMClient {
   private socket: net.Socket | null = null;
@@ -16,6 +26,7 @@ class KVMClient {
   private screenHeight = 1080;
   private cursorX = 960;
   private cursorY = 540;
+  private hostIndex = 0;
 
   async start() {
     mouse.config.autoDelayMs = 0;
@@ -31,11 +42,14 @@ class KVMClient {
   }
 
   private connectToServer() {
+    const targetHost = FALLBACK_HOSTS[this.hostIndex % FALLBACK_HOSTS.length];
     const socket = new net.Socket();
     socket.setNoDelay(true);
 
-    socket.connect(SERVER_PORT, SERVER_HOST, () => {
-      console.log(`[Cliente] Conectado ao Servidor em ${SERVER_HOST}:${SERVER_PORT}`);
+    console.log(`[Cliente] Tentando conectar ao Servidor em ${targetHost}:${SERVER_PORT}...`);
+
+    socket.connect({ port: SERVER_PORT, host: targetHost, family: 4 }, () => {
+      console.log(`[Cliente] Conectado com sucesso ao Servidor em ${targetHost}:${SERVER_PORT}`);
       this.socket = socket;
     });
 
@@ -57,14 +71,15 @@ class KVMClient {
     });
 
     socket.on('close', () => {
-      console.log('[Cliente] Conexão encerrada. Tentando reconectar em 3s...');
+      console.log('[Cliente] Conexão encerrada. Tentando reconectar em 2s...');
       this.socket = null;
       this.isActive = false;
-      setTimeout(() => this.connectToServer(), 3000);
+      this.hostIndex++;
+      setTimeout(() => this.connectToServer(), 2000);
     });
 
     socket.on('error', (err) => {
-      console.error('[Cliente] Erro de conexão:', err.message);
+      console.error(`[Cliente] Erro ao conectar em ${targetHost}:`, err.message);
     });
   }
 
