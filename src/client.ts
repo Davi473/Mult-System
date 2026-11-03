@@ -1,8 +1,10 @@
 import net from 'net';
 import { mouse, keyboard, screen, Button, Point } from '@nut-tree-fork/nut-js';
-import { KVMPacket, serializePacket, UIOHOOK_TO_NUT_KEY } from './protocol';
+import { KVMPacket, serializePacket, UIOHOOK_TO_NUT_KEY, loadEnv } from './protocol';
 
-const SERVER_HOST = process.env.SERVER_HOST || '127.0.0.1';
+loadEnv();
+
+const SERVER_HOST = process.argv[2] || process.env.SERVER_HOST || '127.0.0.1';
 const SERVER_PORT = Number(process.env.KVM_PORT) || 5000;
 // Se o Cliente está à direita do Servidor, a borda de retorno ao Servidor é a esquerda ('left')
 const RETURN_EDGE: 'left' | 'right' = (process.env.RETURN_EDGE as 'left' | 'right') || 'left';

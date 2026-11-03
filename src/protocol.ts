@@ -1,5 +1,28 @@
+import fs from 'fs';
+import path from 'path';
 import { Key } from '@nut-tree-fork/nut-js';
 import { UiohookKey } from 'uiohook-napi';
+
+/**
+ * Carrega variáveis do arquivo .env na raiz do projeto (compatível com Windows, Linux e macOS)
+ */
+export function loadEnv(): void {
+  const envPath = path.resolve(process.cwd(), '.env');
+  if (!fs.existsSync(envPath)) return;
+
+  const content = fs.readFileSync(envPath, 'utf-8');
+  for (const rawLine of content.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith('#')) continue;
+    const eqIndex = line.indexOf('=');
+    if (eqIndex === -1) continue;
+    const key = line.slice(0, eqIndex).trim();
+    const value = line.slice(eqIndex + 1).trim().replace(/^['"]|['"]$/g, '');
+    if (process.env[key] === undefined) {
+      process.env[key] = value;
+    }
+  }
+}
 
 export type ScreenEdge = 'left' | 'right';
 

@@ -1,7 +1,9 @@
 import net from 'net';
 import { uIOhook } from 'uiohook-napi';
 import { mouse, screen, Point } from '@nut-tree-fork/nut-js';
-import { KVMPacket, serializePacket } from './protocol';
+import { KVMPacket, serializePacket, loadEnv } from './protocol';
+
+loadEnv();
 
 const PORT = Number(process.env.KVM_PORT) || 5000;
 // Define em qual borda do Servidor o monitor do Cliente está posicionado ('right' ou 'left')
