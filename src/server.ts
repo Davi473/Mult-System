@@ -1,218 +1,102 @@
 import net from 'net';
-import { uIOhook } from 'uiohook-napi';
-import { mouse, screen, Point } from '@nut-tree-fork/nut-js';
-import { KVMPacket, serializePacket, loadEnv } from './protocol';
-import { LinuxEvdevServer } from './linuxInput';
+import { createCapture } from './capture';
+import { Packet, LineReader, encode, loadEnv, parseEdge } from './protocol';
 
 loadEnv();
 
 const PORT = Number(process.env.KVM_PORT) || 5000;
-// Define em qual borda do Servidor o monitor do Cliente está posicionado ('right' ou 'left')
-const CLIENT_EDGE: 'right' | 'left' = (process.env.CLIENT_EDGE as 'right' | 'left') || 'right';
+// Em qual borda do Servidor o monitor do Cliente está posicionado ('right' ou 'left')
+const CLIENT_EDGE = parseEdge(process.env.CLIENT_EDGE, 'right');
+// Velocidade/aceleração do cursor LOCAL no Linux (o cursor local é movido pelo próprio KVM)
+const MOUSE_SPEED = Number(process.env.MOUSE_SPEED) || 1.0;
+const MOUSE_ACCEL = process.env.MOUSE_ACCEL !== undefined ? Number(process.env.MOUSE_ACCEL) : 1.0;
 
-class KVMServer {
-  private clientSocket: net.Socket | null = null;
-  private isRemoteActive = false;
-  private screenWidth = 1920;
-  private screenHeight = 1080;
-  private anchorX = 960;
-  private anchorY = 540;
-  private isWarpingPointer = false;
-  private linuxEvdev: LinuxEvdevServer | null = null;
+async function main() {
+  const capture = createCapture({ edge: CLIENT_EDGE, speed: MOUSE_SPEED, accel: MOUSE_ACCEL });
+  let client: net.Socket | null = null;
+  let remote = false;
 
-  async start() {
-    mouse.config.autoDelayMs = 0;
+  const send = (packet: Packet) => {
+    if (client && !client.destroyed) client.write(encode(packet));
+  };
 
-    try {
-      this.screenWidth = await screen.width();
-      this.screenHeight = await screen.height();
-    } catch {
-      this.screenWidth = 1920;
-      this.screenHeight = 1080;
+  const backToServer = (yRatio: number, reason: string) => {
+    if (!remote) return;
+    remote = false;
+    capture.setRemote(false, yRatio);
+    console.log(`[Servidor] Controle de volta no Servidor (${reason}).`);
+  };
+
+  capture.on('edge', (yRatio: number) => {
+    if (!client || remote) return;
+    remote = true;
+    capture.setRemote(true);
+    send({ type: 'enter', yRatio });
+    console.log('[Servidor] Borda atingida -> controle transferido para o Cliente.');
+  });
+
+  capture.on('input', (packet: Packet) => {
+    if (remote) send(packet);
+  });
+
+  capture.on('emergency', () => {
+    if (!remote) return;
+    remote = false;
+    send({ type: 'leave' });
+    console.log('[Servidor] ScrollLock -> controle de volta no Servidor.');
+  });
+
+  capture.on('exit', (code: number) => {
+    console.log(`[Servidor] Captura encerrada (código ${code}). Saindo.`);
+    process.exit(code === 3 ? 0 : 1);
+  });
+
+  await capture.start();
+
+  const server = net.createServer((socket) => {
+    if (client) {
+      console.log('[Servidor] Novo cliente conectado; desconectando o anterior.');
+      client.destroy();
     }
-    this.anchorX = Math.floor(this.screenWidth / 2);
-    this.anchorY = Math.floor(this.screenHeight / 2);
+    client = socket;
+    socket.setNoDelay(true); // Desativa algoritmo de Nagle para menor latência
+    socket.setKeepAlive(true, 2000);
+    console.log(`[Servidor] Cliente conectado: ${socket.remoteAddress}:${socket.remotePort}`);
 
-    console.log(`[Servidor] Resolução detectada: ${this.screenWidth}x${this.screenHeight}`);
-    console.log(`[Servidor] Borda configurada para transição ao Cliente: ${CLIENT_EDGE.toUpperCase()}`);
-
-    this.setupTcpServer();
-
-    if (process.platform === 'linux') {
-      this.setupLinuxEvdevHooks();
-    } else {
-      this.setupGlobalHooks();
-    }
-  }
-
-  private setupTcpServer() {
-    const server = net.createServer((socket) => {
-      console.log(`[Servidor] Cliente conectado: ${socket.remoteAddress}:${socket.remotePort}`);
-      socket.setNoDelay(true);
-      this.clientSocket = socket;
-
-      let buffer = '';
-      socket.on('data', async (chunk) => {
-        buffer += chunk.toString();
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
-
-        for (const line of lines) {
-          if (!line.trim()) continue;
-          try {
-            const packet: KVMPacket = JSON.parse(line);
-            await this.handleClientPacket(packet);
-          } catch (err) {
-            console.error('[Servidor] Erro ao decodificar pacote do cliente:', err);
-          }
-        }
-      });
-
-      socket.on('close', () => {
-        console.log('[Servidor] Cliente desconectado.');
-        this.clientSocket = null;
-        this.isRemoteActive = false;
-        this.linuxEvdev?.ungrab(this.anchorX, this.anchorY);
-      });
-
-      socket.on('error', (err) => {
-        console.error('[Servidor] Erro no socket:', err.message);
-      });
-    });
-
-    server.listen(PORT, () => {
-      console.log(`[Servidor] Escutando conexões TCP na porta ${PORT} (IPv4 e IPv6)...`);
-    });
-  }
-
-  private sendToClient(packet: KVMPacket) {
-    if (this.clientSocket && !this.clientSocket.destroyed) {
-      this.clientSocket.write(serializePacket(packet));
-    }
-  }
-
-  private async handleClientPacket(packet: KVMPacket) {
-    if (packet.type === 'return_server') {
-      this.isRemoteActive = false;
-      const targetY = Math.min(
-        this.screenHeight - 2,
-        Math.max(2, Math.floor(packet.yRatio * this.screenHeight))
-      );
-      const targetX = CLIENT_EDGE === 'right' ? this.screenWidth - 10 : 10;
-
-      if (this.linuxEvdev) {
-        this.linuxEvdev.ungrab(targetX, targetY);
-      } else {
-        this.isWarpingPointer = true;
-        await mouse.setPosition(new Point(targetX, targetY));
-        this.isWarpingPointer = false;
-      }
-
-      console.log('[Servidor] Controle devolvido ao Servidor.');
-    }
-  }
-
-  private setupLinuxEvdevHooks() {
-    this.linuxEvdev = new LinuxEvdevServer(this.screenWidth, this.screenHeight, CLIENT_EDGE);
-    const started = this.linuxEvdev.start();
-    if (!started) {
-      console.log('[Servidor] Usando fallback uIOhook...');
-      this.setupGlobalHooks();
-      return;
-    }
-
-    console.log(
-      '[Servidor] Captura evdev ativa (compatível com Wayland e X11). Pressione ScrollLock a qualquer momento para destravar o mouse.'
-    );
-
-    this.linuxEvdev.on('event', (evt) => {
-      if (!this.clientSocket) return;
-
-      if (evt.type === 'edge_hit' && !this.isRemoteActive) {
-        this.isRemoteActive = true;
-        this.linuxEvdev?.grab();
-        console.log('[Servidor] Borda atingida! Transferindo controle para o Cliente...');
-        this.sendToClient({ type: 'enter_client', yRatio: evt.yRatio });
+    const reader = new LineReader((line) => {
+      let packet: Packet;
+      try {
+        packet = JSON.parse(line);
+      } catch {
         return;
       }
-
-      if (evt.type === 'emergency_release') {
-        this.isRemoteActive = false;
-        console.log('[Servidor] ScrollLock pressionado! Controle retomado no Servidor.');
-        return;
-      }
-
-      if (this.isRemoteActive) {
-        this.sendToClient(evt as KVMPacket);
-      }
-    });
-  }
-
-  private setupGlobalHooks() {
-    uIOhook.on('mousemove', async (e) => {
-      if (!this.clientSocket || this.isWarpingPointer) return;
-
-      if (!this.isRemoteActive) {
-        const hitRightEdge = CLIENT_EDGE === 'right' && e.x >= this.screenWidth - 1;
-        const hitLeftEdge = CLIENT_EDGE === 'left' && e.x <= 0;
-
-        if (hitRightEdge || hitLeftEdge) {
-          this.isRemoteActive = true;
-          const yRatio = e.y / this.screenHeight;
-
-          console.log('[Servidor] Borda atingida! Transferindo controle para o Cliente...');
-          this.sendToClient({ type: 'enter_client', yRatio });
-
-          this.isWarpingPointer = true;
-          await mouse.setPosition(new Point(this.anchorX, this.anchorY));
-          this.isWarpingPointer = false;
-        }
-      } else {
-        const dx = e.x - this.anchorX;
-        const dy = e.y - this.anchorY;
-
-        if (dx !== 0 || dy !== 0) {
-          this.sendToClient({ type: 'mousemove', dx, dy });
-
-          this.isWarpingPointer = true;
-          await mouse.setPosition(new Point(this.anchorX, this.anchorY));
-          this.isWarpingPointer = false;
-        }
-      }
+      if (packet.type === 'return') backToServer(packet.yRatio, 'borda do cliente');
     });
 
-    uIOhook.on('mousedown', (e) => {
-      if (!this.isRemoteActive) return;
-      this.sendToClient({ type: 'mousedown', button: Number(e.button) });
+    socket.on('data', (chunk) => reader.push(chunk));
+    socket.on('error', (err) => console.error('[Servidor] Erro no socket:', err.message));
+    socket.on('close', () => {
+      if (client !== socket) return;
+      client = null;
+      console.log('[Servidor] Cliente desconectado.');
+      backToServer(0.5, 'cliente desconectou');
     });
+  });
 
-    uIOhook.on('mouseup', (e) => {
-      if (!this.isRemoteActive) return;
-      this.sendToClient({ type: 'mouseup', button: Number(e.button) });
-    });
+  server.listen(PORT, () => {
+    console.log(`[Servidor] Escutando na porta TCP ${PORT}. Cliente fica à ${CLIENT_EDGE === 'right' ? 'DIREITA' : 'ESQUERDA'}.`);
+    console.log('[Servidor] ScrollLock: volta ao servidor | no servidor: encerra e libera o mouse.');
+  });
 
-    uIOhook.on('wheel', (e) => {
-      if (!this.isRemoteActive) return;
-      this.sendToClient({
-        type: 'wheel',
-        amount: e.amount,
-        direction: e.direction,
-      });
-    });
-
-    uIOhook.on('keydown', (e) => {
-      if (!this.isRemoteActive) return;
-      this.sendToClient({ type: 'keydown', keycode: e.keycode });
-    });
-
-    uIOhook.on('keyup', (e) => {
-      if (!this.isRemoteActive) return;
-      this.sendToClient({ type: 'keyup', keycode: e.keycode });
-    });
-
-    uIOhook.start();
-    console.log('[Servidor] Hooks globais de mouse e teclado iniciados.');
-  }
+  const shutdown = () => {
+    capture.stop();
+    process.exit(0);
+  };
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
 }
 
-new KVMServer().start().catch(console.error);
+main().catch((err) => {
+  console.error('[Servidor] Erro fatal:', err.message ?? err);
+  process.exit(1);
+});

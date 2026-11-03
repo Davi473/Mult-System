@@ -1,6 +1,6 @@
 {
   "name": "mult-system-kvm",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "KVM Virtual (estilo Synergy/Barrier) em Node.js e TypeScript via TCP Sockets",
   "main": "dist/server.js",
   "scripts": {
@@ -10,7 +10,7 @@
     "prod:server": "node dist/server.js",
     "prod:client": "node dist/client.js"
   },
-  "dependencies": {
+  "optionalDependencies": {
     "@nut-tree-fork/nut-js": "^4.2.0",
     "uiohook-napi": "^1.5.4"
   },

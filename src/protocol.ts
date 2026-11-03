@@ -1,7 +1,50 @@
 import fs from 'fs';
 import path from 'path';
-import { Key } from '@nut-tree-fork/nut-js';
-import { UiohookKey } from 'uiohook-napi';
+
+export type Edge = 'left' | 'right';
+
+/**
+ * Pacotes trocados entre Servidor e Cliente (NDJSON: um JSON por linha).
+ * Teclas usam SEMPRE o código evdev do Linux (ex: A=30, Enter=28) como formato canônico.
+ * Botões: 1=esquerdo, 2=direito, 3=meio, 4=voltar, 5=avançar.
+ * Roda: dy/dx em "cliques" (positivo = cima / direita).
+ */
+export type Packet =
+  | { type: 'enter'; yRatio: number } // servidor -> cliente: controle entrou no cliente
+  | { type: 'leave' } // servidor -> cliente: controle voltou ao servidor (ex: ScrollLock)
+  | { type: 'return'; yRatio: number } // cliente -> servidor: cursor atingiu a borda de retorno
+  | { type: 'move'; dx: number; dy: number }
+  | { type: 'button'; button: number; down: boolean }
+  | { type: 'wheel'; dy: number; dx: number }
+  | { type: 'key'; code: number; down: boolean };
+
+export type InputPacket = Extract<Packet, { type: 'move' | 'button' | 'wheel' | 'key' }>;
+
+export function encode(packet: Packet): string {
+  return JSON.stringify(packet) + '\n';
+}
+
+/** Junta pedaços de um stream (TCP / stdout) e entrega linha a linha. */
+export class LineReader {
+  private buffer = '';
+
+  constructor(private readonly onLine: (line: string) => void) {}
+
+  push(chunk: Buffer | string): void {
+    this.buffer += chunk.toString();
+    let index: number;
+    while ((index = this.buffer.indexOf('\n')) >= 0) {
+      const line = this.buffer.slice(0, index).trim();
+      this.buffer = this.buffer.slice(index + 1);
+      if (line) this.onLine(line);
+    }
+  }
+}
+
+export function parseEdge(value: string | undefined, fallback: Edge): Edge {
+  const v = value?.trim().toLowerCase();
+  return v === 'left' || v === 'right' ? v : fallback;
+}
 
 /**
  * Carrega variáveis do arquivo .env na raiz do projeto (compatível com Windows, Linux e macOS)
@@ -23,119 +66,3 @@ export function loadEnv(): void {
     }
   }
 }
-
-export type ScreenEdge = 'left' | 'right';
-
-export type KVMPacket =
-  | { type: 'enter_client'; yRatio: number }
-  | { type: 'return_server'; yRatio: number }
-  | { type: 'mousemove'; dx: number; dy: number }
-  | { type: 'mousedown'; button: number }
-  | { type: 'mouseup'; button: number }
-  | { type: 'wheel'; amount: number; direction: number }
-  | { type: 'keydown'; keycode: number }
-  | { type: 'keyup'; keycode: number };
-
-/**
- * Serializa um pacote adicionando delimitador de quebra de linha (NDJSON)
- * para evitar problemas de fragmentação/concatenação no stream TCP.
- */
-export function serializePacket(packet: KVMPacket): string {
-  return JSON.stringify(packet) + '\n';
-}
-
-/**
- * Mapeamento básico de keycodes do uiohook-napi para a enum Key do nut-js.
- * Pode ser expandido conforme necessidade.
- */
-export const UIOHOOK_TO_NUT_KEY: Record<number, Key> = {
-  [UiohookKey.A]: Key.A,
-  [UiohookKey.B]: Key.B,
-  [UiohookKey.C]: Key.C,
-  [UiohookKey.D]: Key.D,
-  [UiohookKey.E]: Key.E,
-  [UiohookKey.F]: Key.F,
-  [UiohookKey.G]: Key.G,
-  [UiohookKey.H]: Key.H,
-  [UiohookKey.I]: Key.I,
-  [UiohookKey.J]: Key.J,
-  [UiohookKey.K]: Key.K,
-  [UiohookKey.L]: Key.L,
-  [UiohookKey.M]: Key.M,
-  [UiohookKey.N]: Key.N,
-  [UiohookKey.O]: Key.O,
-  [UiohookKey.P]: Key.P,
-  [UiohookKey.Q]: Key.Q,
-  [UiohookKey.R]: Key.R,
-  [UiohookKey.S]: Key.S,
-  [UiohookKey.T]: Key.T,
-  [UiohookKey.U]: Key.U,
-  [UiohookKey.V]: Key.V,
-  [UiohookKey.W]: Key.W,
-  [UiohookKey.X]: Key.X,
-  [UiohookKey.Y]: Key.Y,
-  [UiohookKey.Z]: Key.Z,
-  [UiohookKey['1']]: Key.Num1,
-  [UiohookKey['2']]: Key.Num2,
-  [UiohookKey['3']]: Key.Num3,
-  [UiohookKey['4']]: Key.Num4,
-  [UiohookKey['5']]: Key.Num5,
-  [UiohookKey['6']]: Key.Num6,
-  [UiohookKey['7']]: Key.Num7,
-  [UiohookKey['8']]: Key.Num8,
-  [UiohookKey['9']]: Key.Num9,
-  [UiohookKey['0']]: Key.Num0,
-  [UiohookKey.Space]: Key.Space,
-  [UiohookKey.Enter]: Key.Return,
-  [UiohookKey.Backspace]: Key.Backspace,
-  [UiohookKey.Tab]: Key.Tab,
-  [UiohookKey.Escape]: Key.Escape,
-  [UiohookKey.Shift]: Key.LeftShift,
-  [UiohookKey.ShiftRight]: Key.RightShift,
-  [UiohookKey.Ctrl]: Key.LeftControl,
-  [UiohookKey.CtrlRight]: Key.RightControl,
-  [UiohookKey.Alt]: Key.LeftAlt,
-  [UiohookKey.AltRight]: Key.RightAlt,
-  [UiohookKey.Meta]: Key.LeftSuper,
-  [UiohookKey.ArrowUp]: Key.Up,
-  [UiohookKey.ArrowDown]: Key.Down,
-  [UiohookKey.ArrowLeft]: Key.Left,
-  [UiohookKey.ArrowRight]: Key.Right,
-  // Linux evdev keycodes completos para Windows 11 (nut-js)
-  58: Key.CapsLock,
-  59: Key.F1,
-  60: Key.F2,
-  61: Key.F3,
-  62: Key.F4,
-  63: Key.F5,
-  64: Key.F6,
-  65: Key.F7,
-  66: Key.F8,
-  67: Key.F9,
-  68: Key.F10,
-  87: Key.F11,
-  88: Key.F12,
-  12: Key.Minus,
-  13: Key.Equal,
-  26: Key.LeftBracket,
-  27: Key.RightBracket,
-  39: Key.Semicolon,
-  40: Key.Quote,
-  41: Key.Grave,
-  43: Key.Backslash,
-  51: Key.Comma,
-  52: Key.Period,
-  53: Key.Slash,
-  102: Key.Home,
-  103: Key.Up,
-  104: Key.PageUp,
-  105: Key.Left,
-  106: Key.Right,
-  107: Key.End,
-  108: Key.Down,
-  109: Key.PageDown,
-  110: Key.Insert,
-  111: Key.Delete,
-  125: Key.LeftSuper,
-  126: Key.RightSuper,
-};
