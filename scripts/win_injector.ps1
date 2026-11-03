@@ -56,6 +56,11 @@ public static class KvmInjector
     [DllImport("user32.dll")] private static extern bool IsClipboardFormatAvailable(uint format);
     [DllImport("user32.dll")] private static extern IntPtr GetClipboardData(uint uFormat);
     [DllImport("user32.dll")] private static extern IntPtr SetClipboardData(uint uFormat, IntPtr hMem);
+    [DllImport("user32.dll")] private static extern uint GetClipboardSequenceNumber();
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern IntPtr CreateWindowExW(
+        uint dwExStyle, string lpClassName, string lpWindowName, uint dwStyle,
+        int x, int y, int nWidth, int nHeight, IntPtr hWndParent, IntPtr hMenu, IntPtr hInstance, IntPtr lpParam);
     [DllImport("kernel32.dll")] private static extern IntPtr GlobalAlloc(uint uFlags, UIntPtr dwBytes);
     [DllImport("kernel32.dll")] private static extern IntPtr GlobalLock(IntPtr hMem);
     [DllImport("kernel32.dll")] private static extern bool GlobalUnlock(IntPtr hMem);
@@ -113,10 +118,24 @@ public static class KvmInjector
     private static long cooldownUntilTick;
     private static long lastPosTick;
     private static string lastClipboard = "";
+    private static uint lastClipSeq = 0;
+    private static IntPtr clipHwnd = IntPtr.Zero;
+    private static readonly object clipLock = new object();
+    private static Timer clipTimer;
 
     private static void Send(INPUT input)
     {
         SendInput(1, new INPUT[] { input }, InputSize);
+    }
+
+    private static IntPtr EnsureClipWindow()
+    {
+        if (clipHwnd == IntPtr.Zero)
+        {
+            // HWND_MESSAGE = -3 (necessário no Win32 para que EmptyClipboard + SetClipboardData funcione)
+            clipHwnd = CreateWindowExW(0, "Static", "MultSystemKVMClip", 0, 0, 0, 0, 0, new IntPtr(-3), IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
+        }
+        return clipHwnd;
     }
 
     private static string ReadClipboardText()
@@ -124,7 +143,7 @@ public static class KvmInjector
         if (!IsClipboardFormatAvailable(CF_UNICODETEXT)) return null;
         for (int attempt = 0; attempt < 5; attempt++)
         {
-            if (OpenClipboard(IntPtr.Zero))
+            if (OpenClipboard(EnsureClipWindow()))
             {
                 try
                 {
@@ -145,43 +164,54 @@ public static class KvmInjector
     private static void WriteClipboardText(string text)
     {
         if (string.IsNullOrEmpty(text)) return;
-        lastClipboard = text;
-        for (int attempt = 0; attempt < 5; attempt++)
+        lock (clipLock)
         {
-            if (OpenClipboard(IntPtr.Zero))
+            lastClipboard = text;
+            for (int attempt = 0; attempt < 5; attempt++)
             {
-                try
+                if (OpenClipboard(EnsureClipWindow()))
                 {
-                    EmptyClipboard();
-                    byte[] bytes = Encoding.Unicode.GetBytes(text + "\0");
-                    IntPtr hGlobal = GlobalAlloc(GMEM_MOVEABLE, (UIntPtr)bytes.Length);
-                    if (hGlobal == IntPtr.Zero) return;
-                    IntPtr target = GlobalLock(hGlobal);
-                    if (target == IntPtr.Zero) return;
-                    try { Marshal.Copy(bytes, 0, target, bytes.Length); }
-                    finally { GlobalUnlock(hGlobal); }
-                    SetClipboardData(CF_UNICODETEXT, hGlobal);
-                    return;
+                    try
+                    {
+                        EmptyClipboard();
+                        byte[] bytes = Encoding.Unicode.GetBytes(text + "\0");
+                        IntPtr hGlobal = GlobalAlloc(GMEM_MOVEABLE, (UIntPtr)bytes.Length);
+                        if (hGlobal == IntPtr.Zero) return;
+                        IntPtr target = GlobalLock(hGlobal);
+                        if (target == IntPtr.Zero) return;
+                        try { Marshal.Copy(bytes, 0, target, bytes.Length); }
+                        finally { GlobalUnlock(hGlobal); }
+                        SetClipboardData(CF_UNICODETEXT, hGlobal);
+                        lastClipSeq = GetClipboardSequenceNumber();
+                        return;
+                    }
+                    finally { CloseClipboard(); }
                 }
-                finally { CloseClipboard(); }
+                Thread.Sleep(10);
             }
-            Thread.Sleep(10);
         }
     }
 
     private static void CheckAndSendClipboard()
     {
-        try
+        lock (clipLock)
         {
-            string txt = ReadClipboardText();
-            if (!string.IsNullOrEmpty(txt) && txt != lastClipboard)
+            try
             {
-                lastClipboard = txt;
-                string b64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(txt));
-                output.WriteLine("cb " + b64);
+                uint seq = GetClipboardSequenceNumber();
+                if (seq == lastClipSeq) return;
+                lastClipSeq = seq;
+
+                string txt = ReadClipboardText();
+                if (!string.IsNullOrEmpty(txt) && txt != lastClipboard)
+                {
+                    lastClipboard = txt;
+                    string b64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(txt));
+                    output.WriteLine("cb " + b64);
+                }
             }
+            catch { }
         }
-        catch { }
     }
 
     private static void Mouse(int dx, int dy, uint data, uint flags)
@@ -453,6 +483,9 @@ public static class KvmInjector
         output = new StreamWriter(Console.OpenStandardOutput(), new UTF8Encoding(false));
         output.AutoFlush = true;
         output.WriteLine("ready " + vw + "x" + vh);
+
+        lastClipSeq = GetClipboardSequenceNumber();
+        clipTimer = new Timer(_ => CheckAndSendClipboard(), null, 400, 400);
 
         StreamReader input = new StreamReader(Console.OpenStandardInput(), Encoding.ASCII);
         string line;

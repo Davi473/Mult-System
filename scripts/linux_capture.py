@@ -54,7 +54,7 @@ def ev(t, c, v):
 
 
 class LinuxClipboard:
-    """Sincroniza a área de transferência do Linux (Wayland/X11) via GTK3."""
+    """Sincroniza a área de transferência do Linux (Wayland/X11) via GTK3 (forçando XWayland GDK_BACKEND=x11)."""
 
     def __init__(self):
         self.available = False
@@ -62,6 +62,9 @@ class LinuxClipboard:
         self.cb = None
         self.GLib = None
         try:
+            # No Wayland, processos em background precisam usar o backend X11 (XWayland)
+            # para conseguir ler/escrever o clipboard global sem precisar de janela em foco.
+            os.environ["GDK_BACKEND"] = "x11"
             import gi
 
             gi.require_version("Gtk", "3.0")
@@ -72,10 +75,19 @@ class LinuxClipboard:
             self.GLib = GLib
             self.cb = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
             self.available = True
+            # Monitora mudanças no clipboard do Linux a cada 400ms automaticamente
+            GLib.timeout_add(400, self._poll)
             t = threading.Thread(target=Gtk.main, daemon=True)
             t.start()
         except Exception as e:
             log("Clipboard GTK3 indisponível: %s" % e)
+
+    def _poll(self):
+        try:
+            self.cb.request_text(self._on_text)
+        except Exception:
+            pass
+        return True
 
     def read_and_send(self):
         if not self.available:

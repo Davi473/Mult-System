@@ -118,7 +118,10 @@ async function main() {
   });
 
   capture.on('clipboard', (text: string) => {
-    send({ type: 'clipboard', text });
+    if (client && !client.destroyed) {
+      send({ type: 'clipboard', text });
+      console.log('[Servidor] Área de transferência enviada para o Cliente Windows.');
+    }
   });
 
   capture.on('emergency', () => {
