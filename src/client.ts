@@ -1,6 +1,7 @@
 import net from 'net';
 import { mouse, keyboard, screen, Button, Point } from '@nut-tree-fork/nut-js';
 import { KVMPacket, serializePacket, UIOHOOK_TO_NUT_KEY, loadEnv } from './protocol';
+import { LinuxUinputClient } from './linuxInput';
 
 loadEnv();
 
@@ -9,7 +10,6 @@ const SERVER_PORT = Number(process.env.KVM_PORT) || 5000;
 // Se o Cliente está à direita do Servidor, a borda de retorno ao Servidor é a esquerda ('left')
 const RETURN_EDGE: 'left' | 'right' = (process.env.RETURN_EDGE as 'left' | 'right') || 'left';
 
-// Lista de candidatos de host/IP caso o nome DNS local falhe sem sufixo .local
 const FALLBACK_HOSTS = Array.from(
   new Set([
     SERVER_HOST,
@@ -27,13 +27,26 @@ class KVMClient {
   private cursorX = 960;
   private cursorY = 540;
   private hostIndex = 0;
+  private linuxUinput: LinuxUinputClient | null = null;
 
   async start() {
     mouse.config.autoDelayMs = 0;
     keyboard.config.autoDelayMs = 0;
 
-    this.screenWidth = await screen.width();
-    this.screenHeight = await screen.height();
+    try {
+      this.screenWidth = await screen.width();
+      this.screenHeight = await screen.height();
+    } catch {
+      this.screenWidth = 1920;
+      this.screenHeight = 1080;
+    }
+
+    if (process.platform === 'linux') {
+      const uinput = new LinuxUinputClient(this.screenWidth, this.screenHeight);
+      if (uinput.start()) {
+        this.linuxUinput = uinput;
+      }
+    }
 
     console.log(`[Cliente] Resolução local: ${this.screenWidth}x${this.screenHeight}`);
     console.log(`[Cliente] Borda de retorno ao Servidor: ${RETURN_EDGE.toUpperCase()}`);
@@ -102,6 +115,14 @@ class KVMClient {
     }
   }
 
+  private async setCursorPos(x: number, y: number) {
+    if (this.linuxUinput) {
+      this.linuxUinput.moveTo(x, y);
+    } else {
+      await mouse.setPosition(new Point(x, y));
+    }
+  }
+
   private async handleServerPacket(packet: KVMPacket) {
     switch (packet.type) {
       case 'enter_client': {
@@ -110,9 +131,9 @@ class KVMClient {
           this.screenHeight - 2,
           Math.max(2, Math.floor(packet.yRatio * this.screenHeight))
         );
-        this.cursorX = RETURN_EDGE === 'left' ? 5 : this.screenWidth - 5;
+        this.cursorX = RETURN_EDGE === 'left' ? 10 : this.screenWidth - 10;
 
-        await mouse.setPosition(new Point(this.cursorX, this.cursorY));
+        await this.setCursorPos(this.cursorX, this.cursorY);
         console.log('[Cliente] Controle recebido no Cliente!');
         break;
       }
@@ -123,7 +144,6 @@ class KVMClient {
         this.cursorX += packet.dx;
         this.cursorY = Math.min(this.screenHeight - 1, Math.max(0, this.cursorY + packet.dy));
 
-        // Verifica se o cursor bateu na borda de retorno para o Servidor
         const hitLeftReturn = RETURN_EDGE === 'left' && this.cursorX <= 0;
         const hitRightReturn = RETURN_EDGE === 'right' && this.cursorX >= this.screenWidth - 1;
 
@@ -135,49 +155,68 @@ class KVMClient {
           return;
         }
 
-        // Limita cursorX aos limites da tela do cliente
         this.cursorX = Math.min(this.screenWidth - 1, Math.max(0, this.cursorX));
-        await mouse.setPosition(new Point(this.cursorX, this.cursorY));
+        await this.setCursorPos(this.cursorX, this.cursorY);
         break;
       }
 
       case 'mousedown': {
         if (!this.isActive) return;
-        await mouse.pressButton(this.mapMouseButton(packet.button));
+        if (this.linuxUinput) {
+          this.linuxUinput.mouseButton(packet.button, true);
+        } else {
+          await mouse.pressButton(this.mapMouseButton(packet.button));
+        }
         break;
       }
 
       case 'mouseup': {
         if (!this.isActive) return;
-        await mouse.releaseButton(this.mapMouseButton(packet.button));
+        if (this.linuxUinput) {
+          this.linuxUinput.mouseButton(packet.button, false);
+        } else {
+          await mouse.releaseButton(this.mapMouseButton(packet.button));
+        }
         break;
       }
 
       case 'wheel': {
         if (!this.isActive) return;
-        const scrollAmount = packet.amount * 30;
-        if (packet.direction > 0) {
-          await mouse.scrollDown(scrollAmount);
+        if (this.linuxUinput) {
+          this.linuxUinput.wheel(packet.amount, packet.direction);
         } else {
-          await mouse.scrollUp(scrollAmount);
+          const scrollAmount = packet.amount * 30;
+          if (packet.direction > 0) {
+            await mouse.scrollDown(scrollAmount);
+          } else {
+            await mouse.scrollUp(scrollAmount);
+          }
         }
         break;
       }
 
       case 'keydown': {
         if (!this.isActive) return;
-        const nutKey = UIOHOOK_TO_NUT_KEY[packet.keycode];
-        if (nutKey !== undefined) {
-          await keyboard.pressKey(nutKey);
+        if (this.linuxUinput) {
+          this.linuxUinput.key(packet.keycode, true);
+        } else {
+          const nutKey = UIOHOOK_TO_NUT_KEY[packet.keycode];
+          if (nutKey !== undefined) {
+            await keyboard.pressKey(nutKey);
+          }
         }
         break;
       }
 
       case 'keyup': {
         if (!this.isActive) return;
-        const nutKey = UIOHOOK_TO_NUT_KEY[packet.keycode];
-        if (nutKey !== undefined) {
-          await keyboard.releaseKey(nutKey);
+        if (this.linuxUinput) {
+          this.linuxUinput.key(packet.keycode, false);
+        } else {
+          const nutKey = UIOHOOK_TO_NUT_KEY[packet.keycode];
+          if (nutKey !== undefined) {
+            await keyboard.releaseKey(nutKey);
+          }
         }
         break;
       }

@@ -2,6 +2,7 @@ import net from 'net';
 import { uIOhook } from 'uiohook-napi';
 import { mouse, screen, Point } from '@nut-tree-fork/nut-js';
 import { KVMPacket, serializePacket, loadEnv } from './protocol';
+import { LinuxEvdevServer } from './linuxInput';
 
 loadEnv();
 
@@ -17,12 +18,18 @@ class KVMServer {
   private anchorX = 960;
   private anchorY = 540;
   private isWarpingPointer = false;
+  private linuxEvdev: LinuxEvdevServer | null = null;
 
   async start() {
     mouse.config.autoDelayMs = 0;
 
-    this.screenWidth = await screen.width();
-    this.screenHeight = await screen.height();
+    try {
+      this.screenWidth = await screen.width();
+      this.screenHeight = await screen.height();
+    } catch {
+      this.screenWidth = 1920;
+      this.screenHeight = 1080;
+    }
     this.anchorX = Math.floor(this.screenWidth / 2);
     this.anchorY = Math.floor(this.screenHeight / 2);
 
@@ -30,13 +37,18 @@ class KVMServer {
     console.log(`[Servidor] Borda configurada para transição ao Cliente: ${CLIENT_EDGE.toUpperCase()}`);
 
     this.setupTcpServer();
-    this.setupGlobalHooks();
+
+    if (process.platform === 'linux') {
+      this.setupLinuxEvdevHooks();
+    } else {
+      this.setupGlobalHooks();
+    }
   }
 
   private setupTcpServer() {
     const server = net.createServer((socket) => {
       console.log(`[Servidor] Cliente conectado: ${socket.remoteAddress}:${socket.remotePort}`);
-      socket.setNoDelay(true); // Desativa algoritmo de Nagle para menor latência
+      socket.setNoDelay(true);
       this.clientSocket = socket;
 
       let buffer = '';
@@ -60,6 +72,7 @@ class KVMServer {
         console.log('[Servidor] Cliente desconectado.');
         this.clientSocket = null;
         this.isRemoteActive = false;
+        this.linuxEvdev?.ungrab(this.anchorX, this.anchorY);
       });
 
       socket.on('error', (err) => {
@@ -85,14 +98,54 @@ class KVMServer {
         this.screenHeight - 2,
         Math.max(2, Math.floor(packet.yRatio * this.screenHeight))
       );
-      const targetX = CLIENT_EDGE === 'right' ? this.screenWidth - 5 : 5;
+      const targetX = CLIENT_EDGE === 'right' ? this.screenWidth - 10 : 10;
 
-      this.isWarpingPointer = true;
-      await mouse.setPosition(new Point(targetX, targetY));
-      this.isWarpingPointer = false;
+      if (this.linuxEvdev) {
+        this.linuxEvdev.ungrab(targetX, targetY);
+      } else {
+        this.isWarpingPointer = true;
+        await mouse.setPosition(new Point(targetX, targetY));
+        this.isWarpingPointer = false;
+      }
 
       console.log('[Servidor] Controle devolvido ao Servidor.');
     }
+  }
+
+  private setupLinuxEvdevHooks() {
+    this.linuxEvdev = new LinuxEvdevServer(this.screenWidth, this.screenHeight, CLIENT_EDGE);
+    const started = this.linuxEvdev.start();
+    if (!started) {
+      console.log('[Servidor] Usando fallback uIOhook...');
+      this.setupGlobalHooks();
+      return;
+    }
+
+    console.log(
+      '[Servidor] Captura evdev ativa (compatível com Wayland e X11). Pressione ScrollLock a qualquer momento para destravar o mouse.'
+    );
+
+    this.linuxEvdev.on('event', (evt) => {
+      if (!this.clientSocket) return;
+
+      if (evt.type === 'edge_hit' && !this.isRemoteActive) {
+        this.isRemoteActive = true;
+        this.linuxEvdev?.grab();
+        console.log('[Servidor] Borda atingida! Transferindo controle para o Cliente...');
+        this.sendToClient({ type: 'enter_client', yRatio: evt.yRatio });
+        return;
+      }
+
+      if (evt.type === 'emergency_release') {
+        this.isRemoteActive = false;
+        console.log('[Servidor] ScrollLock pressionado! Controle retomado no Servidor.');
+        return;
+      }
+
+      if (this.isRemoteActive) {
+        this.sendToClient(evt as KVMPacket);
+      }
+    });
   }
 
   private setupGlobalHooks() {
@@ -100,7 +153,6 @@ class KVMServer {
       if (!this.clientSocket || this.isWarpingPointer) return;
 
       if (!this.isRemoteActive) {
-        // Detecção de borda no Servidor
         const hitRightEdge = CLIENT_EDGE === 'right' && e.x >= this.screenWidth - 1;
         const hitLeftEdge = CLIENT_EDGE === 'left' && e.x <= 0;
 
@@ -111,20 +163,17 @@ class KVMServer {
           console.log('[Servidor] Borda atingida! Transferindo controle para o Cliente...');
           this.sendToClient({ type: 'enter_client', yRatio });
 
-          // Ancora o cursor no centro da tela do Servidor para calcular deltas (dx, dy) contínuos
           this.isWarpingPointer = true;
           await mouse.setPosition(new Point(this.anchorX, this.anchorY));
           this.isWarpingPointer = false;
         }
       } else {
-        // Modo Remoto Ativo: calcula movimento relativo em relação à âncora
         const dx = e.x - this.anchorX;
         const dy = e.y - this.anchorY;
 
         if (dx !== 0 || dy !== 0) {
           this.sendToClient({ type: 'mousemove', dx, dy });
 
-          // Reposiciona o cursor físico na âncora para impedir que trave nas bordas locais
           this.isWarpingPointer = true;
           await mouse.setPosition(new Point(this.anchorX, this.anchorY));
           this.isWarpingPointer = false;

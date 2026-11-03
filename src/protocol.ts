@@ -101,4 +101,10 @@ export const UIOHOOK_TO_NUT_KEY: Record<number, Key> = {
   [UiohookKey.ArrowDown]: Key.Down,
   [UiohookKey.ArrowLeft]: Key.Left,
   [UiohookKey.ArrowRight]: Key.Right,
+  // Linux evdev keycodes equivalentes para setas e teclas especiais
+  103: Key.Up,
+  108: Key.Down,
+  105: Key.Left,
+  106: Key.Right,
+  125: Key.LeftSuper,
 };
