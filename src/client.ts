@@ -28,6 +28,9 @@ class KVMClient {
   private cursorY = 540;
   private hostIndex = 0;
   private linuxUinput: LinuxUinputClient | null = null;
+  private isMovingMouse = false;
+  private pendingMouseMove = false;
+  private actionQueue: Promise<void> = Promise.resolve();
 
   async start() {
     mouse.config.autoDelayMs = 0;
@@ -67,7 +70,7 @@ class KVMClient {
     });
 
     let buffer = '';
-    socket.on('data', async (chunk) => {
+    socket.on('data', (chunk) => {
       buffer += chunk.toString();
       const lines = buffer.split('\n');
       buffer = lines.pop() || '';
@@ -76,7 +79,7 @@ class KVMClient {
         if (!line.trim()) continue;
         try {
           const packet: KVMPacket = JSON.parse(line);
-          await this.handleServerPacket(packet);
+          this.handleServerPacket(packet);
         } catch (err) {
           console.error('[Cliente] Erro ao processar pacote:', err);
         }
@@ -115,15 +118,41 @@ class KVMClient {
     }
   }
 
-  private async setCursorPos(x: number, y: number) {
+  /**
+   * Agrupa (coalesce) eventos de mouse de alta frequência (1000Hz) no Windows 11
+   * para evitar fila de Promises atrasadas no nut-js.
+   */
+  private scheduleCursorMove() {
     if (this.linuxUinput) {
-      this.linuxUinput.moveTo(x, y);
-    } else {
-      await mouse.setPosition(new Point(x, y));
+      this.linuxUinput.moveTo(this.cursorX, this.cursorY);
+      return;
     }
+
+    this.pendingMouseMove = true;
+    if (this.isMovingMouse) return;
+
+    this.isMovingMouse = true;
+    const flush = async () => {
+      while (this.pendingMouseMove && this.isActive) {
+        this.pendingMouseMove = false;
+        const targetX = this.cursorX;
+        const targetY = this.cursorY;
+        try {
+          await mouse.setPosition(new Point(targetX, targetY));
+        } catch {
+          // ignore
+        }
+      }
+      this.isMovingMouse = false;
+    };
+    flush();
   }
 
-  private async handleServerPacket(packet: KVMPacket) {
+  private enqueueAction(fn: () => Promise<unknown>) {
+    this.actionQueue = this.actionQueue.then(() => fn()).then(() => {}).catch(() => {});
+  }
+
+  private handleServerPacket(packet: KVMPacket) {
     switch (packet.type) {
       case 'enter_client': {
         this.isActive = true;
@@ -133,8 +162,8 @@ class KVMClient {
         );
         this.cursorX = RETURN_EDGE === 'left' ? 10 : this.screenWidth - 10;
 
-        await this.setCursorPos(this.cursorX, this.cursorY);
-        console.log('[Cliente] Controle recebido no Cliente!');
+        this.scheduleCursorMove();
+        console.log('[Cliente] Controle recebido no Cliente (Windows/Linux)!');
         break;
       }
 
@@ -149,6 +178,7 @@ class KVMClient {
 
         if (hitLeftReturn || hitRightReturn) {
           this.isActive = false;
+          this.pendingMouseMove = false;
           const yRatio = this.cursorY / this.screenHeight;
           console.log('[Cliente] Borda oposta atingida! Devolvendo controle ao Servidor...');
           this.sendToServer({ type: 'return_server', yRatio });
@@ -156,7 +186,7 @@ class KVMClient {
         }
 
         this.cursorX = Math.min(this.screenWidth - 1, Math.max(0, this.cursorX));
-        await this.setCursorPos(this.cursorX, this.cursorY);
+        this.scheduleCursorMove();
         break;
       }
 
@@ -165,7 +195,8 @@ class KVMClient {
         if (this.linuxUinput) {
           this.linuxUinput.mouseButton(packet.button, true);
         } else {
-          await mouse.pressButton(this.mapMouseButton(packet.button));
+          const btn = this.mapMouseButton(packet.button);
+          this.enqueueAction(() => mouse.pressButton(btn));
         }
         break;
       }
@@ -175,7 +206,8 @@ class KVMClient {
         if (this.linuxUinput) {
           this.linuxUinput.mouseButton(packet.button, false);
         } else {
-          await mouse.releaseButton(this.mapMouseButton(packet.button));
+          const btn = this.mapMouseButton(packet.button);
+          this.enqueueAction(() => mouse.releaseButton(btn));
         }
         break;
       }
@@ -185,11 +217,11 @@ class KVMClient {
         if (this.linuxUinput) {
           this.linuxUinput.wheel(packet.amount, packet.direction);
         } else {
-          const scrollAmount = packet.amount * 30;
+          const scrollAmount = packet.amount * 50;
           if (packet.direction > 0) {
-            await mouse.scrollDown(scrollAmount);
+            this.enqueueAction(() => mouse.scrollDown(scrollAmount));
           } else {
-            await mouse.scrollUp(scrollAmount);
+            this.enqueueAction(() => mouse.scrollUp(scrollAmount));
           }
         }
         break;
@@ -202,7 +234,7 @@ class KVMClient {
         } else {
           const nutKey = UIOHOOK_TO_NUT_KEY[packet.keycode];
           if (nutKey !== undefined) {
-            await keyboard.pressKey(nutKey);
+            this.enqueueAction(() => keyboard.pressKey(nutKey));
           }
         }
         break;
@@ -215,7 +247,7 @@ class KVMClient {
         } else {
           const nutKey = UIOHOOK_TO_NUT_KEY[packet.keycode];
           if (nutKey !== undefined) {
-            await keyboard.releaseKey(nutKey);
+            this.enqueueAction(() => keyboard.releaseKey(nutKey));
           }
         }
         break;
