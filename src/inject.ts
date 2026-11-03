@@ -43,6 +43,13 @@ export class Injector extends EventEmitter {
           if (parts.length >= 2) {
             this.emit('pos', { x: Number(parts[0]), y: Number(parts[1]) });
           }
+        } else if (line.startsWith('cb ')) {
+          try {
+            const text = Buffer.from(line.slice(3).trim(), 'base64').toString('utf8');
+            if (text) this.emit('clipboard', text);
+          } catch {
+            // ignore
+          }
         }
       });
 
@@ -64,6 +71,11 @@ export class Injector extends EventEmitter {
 
   setReturnEdge(edge: Edge) {
     this.write(`c ${edge}`);
+  }
+  setClipboard(text: string) {
+    if (!text) return;
+    const b64 = Buffer.from(text, 'utf8').toString('base64');
+    this.write(`cb ${b64}`);
   }
   enter(yRatio: number) {
     this.write(`e ${Math.min(1, Math.max(0, yRatio)).toFixed(4)}`);

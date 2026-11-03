@@ -7,6 +7,7 @@ import { SCRIPTS_DIR, detectLinuxScreen, ensureLinuxDeviceAccess } from './platf
 export interface Capture extends EventEmitter {
   start(): Promise<{ width: number; height: number }>;
   setRemote(on: boolean, yRatio?: number): void;
+  setClipboard(text: string): void;
   updateConfig(cfg: Partial<CaptureOptions>): void;
   centerCursor(): void;
   stop(): void;
@@ -67,6 +68,9 @@ class LinuxCapture extends EventEmitter implements Capture {
           case 'pos':
             this.emit('pos', { x: Number(msg.x), y: Number(msg.y) });
             break;
+          case 'clipboard':
+            if (msg.text) this.emit('clipboard', String(msg.text));
+            break;
           case 'emergency':
             this.emit('emergency');
             break;
@@ -93,6 +97,11 @@ class LinuxCapture extends EventEmitter implements Capture {
 
   setRemote(on: boolean, yRatio?: number): void {
     this.proc?.stdin?.write(JSON.stringify({ cmd: 'remote', on, yRatio }) + '\n');
+  }
+
+  setClipboard(text: string): void {
+    if (!text) return;
+    this.proc?.stdin?.write(JSON.stringify({ cmd: 'clipboard', text }) + '\n');
   }
 
   updateConfig(cfg: Partial<CaptureOptions>): void {
@@ -218,6 +227,10 @@ class GenericCapture extends EventEmitter implements Capture {
 
   updateConfig(cfg: Partial<CaptureOptions>): void {
     this.options = { ...this.options, ...cfg };
+  }
+
+  setClipboard(_text: string): void {
+    // no-op on generic fallback
   }
 
   centerCursor(): void {

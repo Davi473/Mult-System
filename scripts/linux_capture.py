@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-Captura de mouse/teclado do SERVIDOR KVM no Linux (funciona em Wayland e X11).
-Suporta bordas: left, right, top, bottom, cooldown anti-ping-pong e telemetria de posição para a UI web.
+Captura de mouse/teclado e sincronização de Clipboard do SERVIDOR KVM no Linux (Wayland e X11).
 """
 import fcntl
 import json
@@ -11,6 +10,7 @@ import select
 import signal
 import struct
 import sys
+import threading
 import time
 
 EVIOCGRAB = 0x40044590
@@ -28,10 +28,14 @@ ABS_X, ABS_Y = 0x00, 0x01
 
 MOUSE_BUTTONS = {0x110: 1, 0x111: 2, 0x112: 3, 0x113: 4, 0x114: 5}
 KEY_SCROLLLOCK = 70
+# Teclas modificadoras (Ctrl, Shift, Alt, Win/Super) não devem enviar auto-repeat (v == 2)
+MODIFIER_KEYS = {29, 42, 54, 56, 97, 100, 125, 126}
 
 EVENT_FMT = "llHHi"
 EVENT_SIZE = struct.calcsize(EVENT_FMT)
 VIRTUAL_PREFIX = "Mult-System Virtual"
+
+stdout_lock = threading.Lock()
 
 
 def log(msg):
@@ -40,12 +44,65 @@ def log(msg):
 
 
 def send(obj):
-    sys.stdout.write(json.dumps(obj, separators=(",", ":")) + "\n")
-    sys.stdout.flush()
+    with stdout_lock:
+        sys.stdout.write(json.dumps(obj, separators=(",", ":")) + "\n")
+        sys.stdout.flush()
 
 
 def ev(t, c, v):
     return struct.pack(EVENT_FMT, 0, 0, t, c, int(v))
+
+
+class LinuxClipboard:
+    """Sincroniza a área de transferência do Linux (Wayland/X11) via GTK3."""
+
+    def __init__(self):
+        self.available = False
+        self.last_text = ""
+        self.cb = None
+        self.GLib = None
+        try:
+            import gi
+
+            gi.require_version("Gtk", "3.0")
+            from gi.repository import Gtk, Gdk, GLib
+
+            self.Gtk = Gtk
+            self.Gdk = Gdk
+            self.GLib = GLib
+            self.cb = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+            self.available = True
+            t = threading.Thread(target=Gtk.main, daemon=True)
+            t.start()
+        except Exception as e:
+            log("Clipboard GTK3 indisponível: %s" % e)
+
+    def read_and_send(self):
+        if not self.available:
+            return
+
+        def _req():
+            self.cb.request_text(self._on_text)
+            return False
+
+        self.GLib.idle_add(_req)
+
+    def _on_text(self, _clipboard, text):
+        if text and text != self.last_text:
+            self.last_text = text
+            send({"type": "clipboard", "text": text})
+
+    def write(self, text):
+        if not self.available or not text:
+            return
+        self.last_text = text
+
+        def _set():
+            self.cb.set_text(text, -1)
+            self.cb.store()
+            return False
+
+        self.GLib.idle_add(_set)
 
 
 def list_devices():
@@ -61,11 +118,11 @@ def list_devices():
         name, handlers, evbits = "", [], 0
         for line in block.splitlines():
             if line.startswith("N: Name="):
-                name = line[len("N: Name="):].strip().strip('"')
+                name = line[len("N: Name=") :].strip().strip('"')
             elif line.startswith("H: Handlers="):
-                handlers = line[len("H: Handlers="):].split()
+                handlers = line[len("H: Handlers=") :].split()
             elif line.startswith("B: EV="):
-                evbits = int(line[len("B: EV="):].strip(), 16)
+                evbits = int(line[len("B: EV=") :].strip(), 16)
 
         if name.startswith(VIRTUAL_PREFIX):
             continue
@@ -142,6 +199,7 @@ class Capture:
         self.last_pos_sent = 0.0
 
         self.pointer = None
+        self.clipboard = LinuxClipboard()
         self.mouse_fds = {}
         self.kbd_fds = {}
         self.motion = {}
@@ -177,13 +235,15 @@ class Capture:
             except OSError as e:
                 log("Não foi possível abrir teclado %s: %s" % (path, e))
 
-        send({
-            "type": "ready",
-            "mice": list(self.mouse_fds.values()),
-            "keyboards": list(self.kbd_fds.values()),
-            "width": self.width,
-            "height": self.height,
-        })
+        send(
+            {
+                "type": "ready",
+                "mice": list(self.mouse_fds.values()),
+                "keyboards": list(self.kbd_fds.values()),
+                "width": self.width,
+                "height": self.height,
+            }
+        )
 
     def close(self):
         for fd in list(self.mouse_fds) + list(self.kbd_fds):
@@ -235,7 +295,7 @@ class Capture:
 
     def read_stdin(self, fd):
         try:
-            chunk = os.read(fd, 4096)
+            chunk = os.read(fd, 16384)
         except BlockingIOError:
             return True
         if not chunk:
@@ -253,6 +313,8 @@ class Capture:
             cmd = msg.get("cmd")
             if cmd == "remote":
                 self.set_remote(bool(msg.get("on")), msg.get("yRatio"))
+            elif cmd == "clipboard":
+                self.clipboard.write(msg.get("text", ""))
             elif cmd == "config":
                 if "edge" in msg:
                     self.edge = msg["edge"]
@@ -297,7 +359,12 @@ class Capture:
                 if v == 1:
                     self.on_scrolllock()
                 continue
-            if self.remote and v in (0, 1, 2):
+            if not self.remote:
+                continue
+            # Ignora auto-repeat (v == 2) em teclas modificadoras (Ctrl, Shift, Alt, Win)
+            if c in MODIFIER_KEYS and v == 2:
+                continue
+            if v in (0, 1, 2):
                 send({"type": "key", "code": c, "down": v != 0})
 
     def on_motion(self, dx, dy):
@@ -374,6 +441,8 @@ class Capture:
         if on == self.remote:
             return
         if on:
+            # Ao entrar no Cliente, lê o clipboard atual do Linux e envia para o Windows 11
+            self.clipboard.read_and_send()
             for fd in list(self.mouse_fds) + list(self.kbd_fds):
                 try:
                     fcntl.ioctl(fd, EVIOCGRAB, 1)

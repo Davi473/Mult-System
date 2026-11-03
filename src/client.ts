@@ -38,6 +38,10 @@ class KVMClient {
         this.send({ type: 'client_pos', x: pos.x, y: pos.y });
       }
     });
+    injector.on('clipboard', (text: string) => {
+      this.send({ type: 'clipboard', text });
+      console.log('[Cliente] Área de transferência enviada para o Servidor Linux.');
+    });
     injector.on('exit', (code: number) => {
       console.error(`[Cliente] Injetor encerrou (código ${code}). Saindo.`);
       process.exit(1);
@@ -100,6 +104,12 @@ class KVMClient {
       case 'config':
         this.injector.setReturnEdge(packet.returnEdge);
         console.log(`[Cliente] Borda de retorno atualizada pelo Servidor: ${packet.returnEdge.toUpperCase()}`);
+        break;
+      case 'clipboard':
+        if (packet.text) {
+          this.injector.setClipboard(packet.text);
+          console.log('[Cliente] Área de transferência recebida do Servidor Linux.');
+        }
         break;
       case 'enter':
         if (packet.returnEdge) {

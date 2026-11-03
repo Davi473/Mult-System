@@ -117,6 +117,10 @@ async function main() {
     if (remote) send(packet);
   });
 
+  capture.on('clipboard', (text: string) => {
+    send({ type: 'clipboard', text });
+  });
+
   capture.on('emergency', () => {
     if (!remote) return;
     remote = false;
@@ -159,6 +163,11 @@ async function main() {
       }
       if (packet.type === 'return' || packet.type === 'return_server') {
         backToServer(Number(packet.yRatio ?? 0.5), 'borda do cliente');
+      } else if (packet.type === 'clipboard') {
+        if (packet.text) {
+          capture.setClipboard(String(packet.text));
+          console.log('[Servidor] Área de transferência recebida do Cliente Windows.');
+        }
       } else if (packet.type === 'client_info') {
         clientScreen = { width: Number(packet.width) || 1920, height: Number(packet.height) || 1080 };
         dashboard.broadcast();

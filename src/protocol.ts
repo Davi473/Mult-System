@@ -24,6 +24,7 @@ export type Packet =
   | { type: 'leave' }
   | { type: 'config'; returnEdge: Edge }
   | { type: 'return'; yRatio: number }
+  | { type: 'clipboard'; text: string }
   | { type: 'client_info'; width: number; height: number }
   | { type: 'client_pos'; x: number; y: number }
   | { type: 'move'; dx: number; dy: number }

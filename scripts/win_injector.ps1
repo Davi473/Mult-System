@@ -1,19 +1,21 @@
 <#
-  Injetor de mouse/teclado do CLIENTE KVM no Windows 11/10.
+  Injetor de mouse/teclado e sincronização de Clipboard do CLIENTE KVM no Windows 11/10.
 
   Comandos via stdin:
     e <ratio>         -> controle entrou: posiciona o cursor a 40px da borda de entrada
     c <edge>          -> atualiza a borda de retorno (left, right, top, bottom)
+    cb <base64>       -> atualiza o Clipboard do Windows com o texto copiado no Linux
     m <dx> <dy>       -> movimento relativo
     b <botao> <0|1>   -> botão (1=esq, 2=dir, 3=meio, 4=voltar, 5=avançar)
     w <dy> <dx>       -> rolagem
-    k <codigo> <0|1>  -> tecla (código evdev do Linux -> scancode Win32)
+    k <codigo> <0|1>  -> tecla (código evdev do Linux -> VirtualKey + Scancode Win32)
     l                 -> controle saiu: solta todas as teclas/botões
 
   Saída via stdout:
     ready <largura>x<altura>
     r <ratio>         -> cursor atingiu a borda de retorno (devolver ao servidor)
     p <x> <y>         -> posição atual do cursor no cliente (para o Frontend visual)
+    cb <base64>       -> texto copiado no Windows (para atualizar o Clipboard do Linux)
 #>
 param([string]$ReturnEdge = 'left')
 
@@ -26,6 +28,7 @@ using System.Globalization;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
 
 public static class KvmInjector
 {
@@ -45,6 +48,17 @@ public static class KvmInjector
     [DllImport("user32.dll")] private static extern bool SetCursorPos(int x, int y);
     [DllImport("user32.dll")] private static extern int GetSystemMetrics(int nIndex);
     [DllImport("user32.dll")] private static extern bool SetProcessDPIAware();
+    [DllImport("user32.dll")] private static extern uint MapVirtualKey(uint uCode, uint uMapType);
+
+    [DllImport("user32.dll")] private static extern bool OpenClipboard(IntPtr hWndNewOwner);
+    [DllImport("user32.dll")] private static extern bool CloseClipboard();
+    [DllImport("user32.dll")] private static extern bool EmptyClipboard();
+    [DllImport("user32.dll")] private static extern bool IsClipboardFormatAvailable(uint format);
+    [DllImport("user32.dll")] private static extern IntPtr GetClipboardData(uint uFormat);
+    [DllImport("user32.dll")] private static extern IntPtr SetClipboardData(uint uFormat, IntPtr hMem);
+    [DllImport("kernel32.dll")] private static extern IntPtr GlobalAlloc(uint uFlags, UIntPtr dwBytes);
+    [DllImport("kernel32.dll")] private static extern IntPtr GlobalLock(IntPtr hMem);
+    [DllImport("kernel32.dll")] private static extern bool GlobalUnlock(IntPtr hMem);
 
     private const uint INPUT_MOUSE = 0;
     private const uint INPUT_KEYBOARD = 1;
@@ -56,16 +70,33 @@ public static class KvmInjector
     private const uint KEYEVENTF_EXTENDEDKEY = 0x0001;
     private const uint KEYEVENTF_KEYUP = 0x0002;
     private const uint KEYEVENTF_SCANCODE = 0x0008;
+    private const uint CF_UNICODETEXT = 13;
+    private const uint GMEM_MOVEABLE = 0x0002;
 
-    private static readonly Dictionary<int, int> Extended = new Dictionary<int, int>
+    // evdev -> (scancode, virtualKey) para teclas estendidas (E0)
+    private static readonly Dictionary<int, int[]> ExtendedKeys = new Dictionary<int, int[]>
     {
-        { 96, 0x1C }, { 97, 0x1D }, { 98, 0x35 }, { 99, 0x37 }, { 100, 0x38 },
-        { 102, 0x47 }, { 103, 0x48 }, { 104, 0x49 }, { 105, 0x4B }, { 106, 0x4D },
-        { 107, 0x4F }, { 108, 0x50 }, { 109, 0x51 }, { 110, 0x52 }, { 111, 0x53 },
-        { 125, 0x5B }, { 126, 0x5C }, { 127, 0x5D },
+        { 96,  new int[] { 0x1C, 0x0D } }, // KP Enter
+        { 97,  new int[] { 0x1D, 0xA3 } }, // Right Ctrl (VK_RCONTROL)
+        { 98,  new int[] { 0x35, 0x6F } }, // KP /
+        { 99,  new int[] { 0x37, 0x2C } }, // PrintScreen
+        { 100, new int[] { 0x38, 0xA5 } }, // Right Alt / AltGr (VK_RMENU)
+        { 102, new int[] { 0x47, 0x24 } }, // Home
+        { 103, new int[] { 0x48, 0x26 } }, // Up
+        { 104, new int[] { 0x49, 0x21 } }, // PageUp
+        { 105, new int[] { 0x4B, 0x25 } }, // Left
+        { 106, new int[] { 0x4D, 0x27 } }, // Right
+        { 107, new int[] { 0x4F, 0x23 } }, // End
+        { 108, new int[] { 0x50, 0x28 } }, // Down
+        { 109, new int[] { 0x51, 0x22 } }, // PageDown
+        { 110, new int[] { 0x52, 0x2D } }, // Insert
+        { 111, new int[] { 0x53, 0x2E } }, // Delete
+        { 125, new int[] { 0x5B, 0x5B } }, // Left Win (VK_LWIN)
+        { 126, new int[] { 0x5C, 0x5C } }, // Right Win (VK_RWIN)
+        { 127, new int[] { 0x5D, 0x5D } }, // Menu (VK_APPS)
     };
 
-    private static readonly Dictionary<int, int> VirtualKeys = new Dictionary<int, int>
+    private static readonly Dictionary<int, int> MediaVirtualKeys = new Dictionary<int, int>
     {
         { 113, 0xAD }, { 114, 0xAE }, { 115, 0xAF }, { 119, 0x13 },
         { 163, 0xB0 }, { 164, 0xB3 }, { 165, 0xB1 }, { 166, 0xB2 },
@@ -81,10 +112,76 @@ public static class KvmInjector
     private static int curX, curY;
     private static long cooldownUntilTick;
     private static long lastPosTick;
+    private static string lastClipboard = "";
 
     private static void Send(INPUT input)
     {
         SendInput(1, new INPUT[] { input }, InputSize);
+    }
+
+    private static string ReadClipboardText()
+    {
+        if (!IsClipboardFormatAvailable(CF_UNICODETEXT)) return null;
+        for (int attempt = 0; attempt < 5; attempt++)
+        {
+            if (OpenClipboard(IntPtr.Zero))
+            {
+                try
+                {
+                    IntPtr handle = GetClipboardData(CF_UNICODETEXT);
+                    if (handle == IntPtr.Zero) return null;
+                    IntPtr ptr = GlobalLock(handle);
+                    if (ptr == IntPtr.Zero) return null;
+                    try { return Marshal.PtrToStringUni(ptr); }
+                    finally { GlobalUnlock(handle); }
+                }
+                finally { CloseClipboard(); }
+            }
+            Thread.Sleep(10);
+        }
+        return null;
+    }
+
+    private static void WriteClipboardText(string text)
+    {
+        if (string.IsNullOrEmpty(text)) return;
+        lastClipboard = text;
+        for (int attempt = 0; attempt < 5; attempt++)
+        {
+            if (OpenClipboard(IntPtr.Zero))
+            {
+                try
+                {
+                    EmptyClipboard();
+                    byte[] bytes = Encoding.Unicode.GetBytes(text + "\0");
+                    IntPtr hGlobal = GlobalAlloc(GMEM_MOVEABLE, (UIntPtr)bytes.Length);
+                    if (hGlobal == IntPtr.Zero) return;
+                    IntPtr target = GlobalLock(hGlobal);
+                    if (target == IntPtr.Zero) return;
+                    try { Marshal.Copy(bytes, 0, target, bytes.Length); }
+                    finally { GlobalUnlock(hGlobal); }
+                    SetClipboardData(CF_UNICODETEXT, hGlobal);
+                    return;
+                }
+                finally { CloseClipboard(); }
+            }
+            Thread.Sleep(10);
+        }
+    }
+
+    private static void CheckAndSendClipboard()
+    {
+        try
+        {
+            string txt = ReadClipboardText();
+            if (!string.IsNullOrEmpty(txt) && txt != lastClipboard)
+            {
+                lastClipboard = txt;
+                string b64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(txt));
+                output.WriteLine("cb " + b64);
+            }
+        }
+        catch { }
     }
 
     private static void Mouse(int dx, int dy, uint data, uint flags)
@@ -188,6 +285,7 @@ public static class KvmInjector
             {
                 active = false;
                 ReleaseAll();
+                CheckAndSendClipboard();
                 output.WriteLine("r " + ratio.ToString("0.0000", CultureInfo.InvariantCulture));
                 return;
             }
@@ -231,29 +329,61 @@ public static class KvmInjector
     {
         INPUT i = new INPUT();
         i.type = INPUT_KEYBOARD;
-        int vk;
-        int scan;
+        int vk = 0;
+        int scan = 0;
+        int[] extPair;
 
-        if (VirtualKeys.TryGetValue(code, out vk))
+        if (MediaVirtualKeys.TryGetValue(code, out vk))
         {
             i.u.ki.wVk = (ushort)vk;
             i.u.ki.dwFlags = (code == 119 ? 0u : KEYEVENTF_EXTENDEDKEY) | (down ? 0u : KEYEVENTF_KEYUP);
         }
+        else if (ExtendedKeys.TryGetValue(code, out extPair))
+        {
+            scan = extPair[0];
+            vk = extPair[1];
+            i.u.ki.wVk = (ushort)vk;
+            i.u.ki.wScan = (ushort)scan;
+            i.u.ki.dwFlags = KEYEVENTF_EXTENDEDKEY | (down ? 0u : KEYEVENTF_KEYUP);
+        }
         else
         {
-            bool ext = false;
             if (code >= 1 && code <= 88) scan = code;
-            else if (code == 89) scan = 0x73;
-            else if (code == 121) scan = 0x7E;
-            else if (Extended.TryGetValue(code, out scan)) ext = true;
+            else if (code == 89) scan = 0x73;  // ABNT2: / ?
+            else if (code == 121) scan = 0x7E; // ABNT2: . do numpad
             else return;
 
-            i.u.ki.wScan = (ushort)scan;
-            i.u.ki.dwFlags = KEYEVENTF_SCANCODE | (ext ? KEYEVENTF_EXTENDEDKEY : 0u) | (down ? 0u : KEYEVENTF_KEYUP);
+            if (code == 29) vk = 0xA2;      // Left Ctrl (VK_LCONTROL)
+            else if (code == 42) vk = 0xA0; // Left Shift (VK_LSHIFT)
+            else if (code == 54) vk = 0xA1; // Right Shift (VK_RSHIFT)
+            else if (code == 56) vk = 0xA4; // Left Alt (VK_LMENU)
+            else vk = (int)MapVirtualKey((uint)scan, 1);
+
+            if (vk != 0)
+            {
+                i.u.ki.wVk = (ushort)vk;
+                i.u.ki.wScan = (ushort)scan;
+                i.u.ki.dwFlags = down ? 0u : KEYEVENTF_KEYUP;
+            }
+            else
+            {
+                i.u.ki.wScan = (ushort)scan;
+                i.u.ki.dwFlags = KEYEVENTF_SCANCODE | (down ? 0u : KEYEVENTF_KEYUP);
+            }
         }
 
         Send(i);
         if (down) PressedKeys.Add(code); else PressedKeys.Remove(code);
+
+        // Se acabou de soltar C (46) ou X (45) com Ctrl (29 ou 97) pressionado, sincroniza o clipboard!
+        if (!down && (code == 46 || code == 45) && (PressedKeys.Contains(29) || PressedKeys.Contains(97)))
+        {
+            ThreadPool.QueueUserWorkItem(_ =>
+            {
+                Thread.Sleep(60);
+                CheckAndSendClipboard();
+            });
+        }
     }
 
     private static void ReleaseAll()
@@ -267,16 +397,48 @@ public static class KvmInjector
 
     private static void Handle(string line)
     {
-        string[] p = line.Split(' ');
-        switch (p[0])
+        string[] p = line.Split(new char[] { ' ' }, 2);
+        string cmd = p[0];
+        string arg = p.Length > 1 ? p[1] : "";
+
+        switch (cmd)
         {
-            case "e": Enter(D(p[1])); break;
-            case "c": returnEdge = p[1].Trim().ToLowerInvariant(); break;
-            case "m": Move(I(p[1]), I(p[2])); break;
-            case "b": if (active) Button(I(p[1]), p[2] == "1"); break;
-            case "w": if (active) Wheel(I(p[1]), I(p[2])); break;
-            case "k": if (active) Key(I(p[1]), p[2] == "1"); break;
-            case "l": active = false; ReleaseAll(); break;
+            case "e": Enter(D(arg)); break;
+            case "c": returnEdge = arg.Trim().ToLowerInvariant(); break;
+            case "cb":
+                try
+                {
+                    string text = Encoding.UTF8.GetString(Convert.FromBase64String(arg.Trim()));
+                    WriteClipboardText(text);
+                }
+                catch { }
+                break;
+            case "m":
+                string[] mp = arg.Split(' ');
+                Move(I(mp[0]), I(mp[1]));
+                break;
+            case "b":
+                if (active)
+                {
+                    string[] bp = arg.Split(' ');
+                    Button(I(bp[0]), bp[1] == "1");
+                }
+                break;
+            case "w":
+                if (active)
+                {
+                    string[] wp = arg.Split(' ');
+                    Wheel(I(wp[0]), I(wp[1]));
+                }
+                break;
+            case "k":
+                if (active)
+                {
+                    string[] kp = arg.Split(' ');
+                    Key(I(kp[0]), kp[1] == "1");
+                }
+                break;
+            case "l": active = false; ReleaseAll(); CheckAndSendClipboard(); break;
         }
     }
 
