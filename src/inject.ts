@@ -4,15 +4,10 @@ import path from 'path';
 import { Edge, LineReader } from './protocol';
 import { SCRIPTS_DIR, detectLinuxScreen, ensureLinuxDeviceAccess } from './platform';
 
-/**
- * Injeta mouse/teclado no CLIENTE através de um processo auxiliar
- * (PowerShell + SendInput no Windows, Python + uinput no Linux).
- * Ambos falam o mesmo protocolo de texto (ver scripts/win_injector.ps1).
- *
- * Eventos: 'return' (yRatio) quando o cursor atinge a borda de retorno; 'exit' (code).
- */
 export class Injector extends EventEmitter {
   private proc: ChildProcess | null = null;
+  public screenWidth = 1920;
+  public screenHeight = 1080;
 
   constructor(
     private readonly command: string,
@@ -22,7 +17,7 @@ export class Injector extends EventEmitter {
     super();
   }
 
-  start(): Promise<void> {
+  start(): Promise<{ width: number; height: number }> {
     return new Promise((resolve, reject) => {
       const proc = spawn(this.command, this.args, {
         stdio: ['pipe', 'pipe', 'inherit'],
@@ -34,10 +29,20 @@ export class Injector extends EventEmitter {
       const reader = new LineReader((line) => {
         if (line.startsWith('ready')) {
           ready = true;
-          console.log(`[Injetor ${this.label}] Pronto (tela ${line.slice(6)})`);
-          resolve();
+          const dims = line.slice(6).trim().split('x');
+          if (dims.length === 2) {
+            this.screenWidth = Number(dims[0]) || 1920;
+            this.screenHeight = Number(dims[1]) || 1080;
+          }
+          console.log(`[Injetor ${this.label}] Pronto (tela ${this.screenWidth}x${this.screenHeight})`);
+          resolve({ width: this.screenWidth, height: this.screenHeight });
         } else if (line.startsWith('r ')) {
           this.emit('return', Number(line.slice(2)));
+        } else if (line.startsWith('p ')) {
+          const parts = line.slice(2).trim().split(' ');
+          if (parts.length >= 2) {
+            this.emit('pos', { x: Number(parts[0]), y: Number(parts[1]) });
+          }
         }
       });
 
@@ -57,6 +62,9 @@ export class Injector extends EventEmitter {
     this.proc?.stdin?.write(line + '\n');
   }
 
+  setReturnEdge(edge: Edge) {
+    this.write(`c ${edge}`);
+  }
   enter(yRatio: number) {
     this.write(`e ${Math.min(1, Math.max(0, yRatio)).toFixed(4)}`);
   }

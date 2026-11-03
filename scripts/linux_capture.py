@@ -1,22 +1,7 @@
 #!/usr/bin/env python3
 """
 Captura de mouse/teclado do SERVIDOR KVM no Linux (funciona em Wayland e X11).
-
-Como funciona:
-  * Enquanto o controle está no SERVIDOR (local), o mouse e o teclado físicos NÃO
-    ficam bloqueados (EVIOCGRAB desligado): o sistema operacional move o cursor
-    nativamente e este script apenas acompanha os deltas (dx, dy) para detectar
-    quando o cursor chega na borda configurada.
-  * Quando o cursor atinge a borda e o Cliente está conectado, o Node.js envia
-    {"cmd":"remote","on":true}: este script ativa EVIOCGRAB no mouse e no teclado
-    físicos (congelando o cursor e bloqueando cliques/teclas locais no Servidor)
-    e envia todos os eventos para o Cliente Windows/Linux.
-  * Quando o cursor retorna da borda do Cliente (ou ao pressionar ScrollLock),
-    o EVIOCGRAB é desativado imediatamente e o controle volta ao Servidor.
-
-Uso:
-  python3 linux_capture.py --list            # lista dispositivos detectados
-  python3 linux_capture.py '<config json>'   # inicia a captura
+Suporta bordas: left, right, top, bottom, cooldown anti-ping-pong e telemetria de posição para a UI web.
 """
 import fcntl
 import json
@@ -41,7 +26,6 @@ SYN_REPORT = 0
 REL_X, REL_Y, REL_HWHEEL, REL_WHEEL = 0x00, 0x01, 0x06, 0x08
 ABS_X, ABS_Y = 0x00, 0x01
 
-# código evdev -> número do botão no protocolo (1=esq, 2=dir, 3=meio, 4=voltar, 5=avançar)
 MOUSE_BUTTONS = {0x110: 1, 0x111: 2, 0x112: 3, 0x113: 4, 0x114: 5}
 KEY_SCROLLLOCK = 70
 
@@ -92,7 +76,6 @@ def list_devices():
 
         is_mouse = any(h.startswith("mouse") for h in handlers) and (evbits & (1 << EV_REL)) != 0
         is_joystick = any(h.startswith("js") for h in handlers)
-        # Teclados reais possuem EV_SYN|EV_KEY|EV_MSC|EV_LED|EV_REP (0x120013)
         is_keyboard = "kbd" in handlers and (evbits & 0x120013) == 0x120013 and not is_joystick
 
         if is_mouse:
@@ -155,6 +138,8 @@ class Capture:
         self.y = self.height // 2
         self.frac_x = 0.0
         self.frac_y = 0.0
+        self.cooldown_until = 0.0
+        self.last_pos_sent = 0.0
 
         self.pointer = None
         self.mouse_fds = {}
@@ -265,8 +250,23 @@ class Capture:
                 msg = json.loads(line)
             except ValueError:
                 continue
-            if msg.get("cmd") == "remote":
+            cmd = msg.get("cmd")
+            if cmd == "remote":
                 self.set_remote(bool(msg.get("on")), msg.get("yRatio"))
+            elif cmd == "config":
+                if "edge" in msg:
+                    self.edge = msg["edge"]
+                    self.edge_notified = False
+                if "speed" in msg:
+                    self.speed = float(msg["speed"])
+                if "accel" in msg:
+                    self.accel = float(msg["accel"])
+            elif cmd == "center":
+                self.x = self.width // 2
+                self.y = self.height // 2
+                if self.pointer:
+                    self.pointer.move(self.x, self.y)
+                send({"type": "pos", "x": self.x, "y": self.y})
         return True
 
     def read_mouse(self, fd):
@@ -316,19 +316,46 @@ class Capture:
             return
 
         nx = self.x + mx
-        ny = min(max(self.y + my, 0), self.height - 1)
-        crossed = (self.edge == "right" and nx >= self.width - 1 and mx > 0) or (
-            self.edge == "left" and nx <= 0 and mx < 0
-        )
-        nx = min(max(nx, 0), self.width - 1)
-        self.x, self.y = nx, ny
+        ny = self.y + my
+        now = time.monotonic()
+
+        crossed = False
+        ratio = 0.5
+        if now >= self.cooldown_until:
+            if self.edge == "right" and nx >= self.width - 1 and mx > 0:
+                crossed = True
+                ratio = min(max(ny, 0), self.height - 1) / float(max(1, self.height - 1))
+            elif self.edge == "left" and nx <= 0 and mx < 0:
+                crossed = True
+                ratio = min(max(ny, 0), self.height - 1) / float(max(1, self.height - 1))
+            elif self.edge == "top" and ny <= 0 and my < 0:
+                crossed = True
+                ratio = min(max(nx, 0), self.width - 1) / float(max(1, self.width - 1))
+            elif self.edge == "bottom" and ny >= self.height - 1 and my > 0:
+                crossed = True
+                ratio = min(max(nx, 0), self.width - 1) / float(max(1, self.width - 1))
+
+        self.x = min(max(nx, 0), self.width - 1)
+        self.y = min(max(ny, 0), self.height - 1)
+
+        if now - self.last_pos_sent >= 0.033:
+            self.last_pos_sent = now
+            send({"type": "pos", "x": self.x, "y": self.y})
 
         if crossed:
             if not self.edge_notified:
                 self.edge_notified = True
-                send({"type": "edge", "yRatio": round(ny / float(self.height - 1), 4)})
-        elif (self.edge == "right" and nx < self.width - 10) or (self.edge == "left" and nx > 10):
-            self.edge_notified = False
+                send({"type": "edge", "yRatio": round(ratio, 4)})
+        else:
+            margin = 20
+            away = (
+                (self.edge == "right" and self.x < self.width - margin)
+                or (self.edge == "left" and self.x > margin)
+                or (self.edge == "top" and self.y > margin)
+                or (self.edge == "bottom" and self.y < self.height - margin)
+            )
+            if away:
+                self.edge_notified = False
 
     def on_button(self, code, down):
         if self.remote:
@@ -343,7 +370,7 @@ class Capture:
             self.set_remote(False, None)
             send({"type": "emergency"})
 
-    def set_remote(self, on, y_ratio):
+    def set_remote(self, on, ratio):
         if on == self.remote:
             return
         if on:
@@ -360,12 +387,27 @@ class Capture:
                 except OSError:
                     pass
             self.remote = False
-            if y_ratio is not None:
-                self.y = min(max(int(float(y_ratio) * (self.height - 1)), 0), self.height - 1)
-            self.x = self.width - 15 if self.edge == "right" else 15
+            self.cooldown_until = time.monotonic() + 0.30
+            r = float(ratio) if ratio is not None else 0.5
+            r = min(max(r, 0.0), 1.0)
+            offset = 40
+            if self.edge == "right":
+                self.x = max(0, self.width - offset)
+                self.y = int(r * (self.height - 1))
+            elif self.edge == "left":
+                self.x = min(self.width - 1, offset)
+                self.y = int(r * (self.height - 1))
+            elif self.edge == "top":
+                self.x = int(r * (self.width - 1))
+                self.y = min(self.height - 1, offset)
+            elif self.edge == "bottom":
+                self.x = int(r * (self.width - 1))
+                self.y = max(0, self.height - offset)
+
             self.frac_x = self.frac_y = 0.0
             if self.pointer:
                 self.pointer.move(self.x, self.y)
+            send({"type": "pos", "x": self.x, "y": self.y})
         self.edge_notified = False
 
 

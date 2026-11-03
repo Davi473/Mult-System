@@ -6,17 +6,15 @@ loadEnv();
 
 const SERVER_HOST = process.argv[2] || process.env.SERVER_HOST || 'servidor';
 const SERVER_PORT = Number(process.env.KVM_PORT) || 5000;
-// Se o Cliente está à direita do Servidor, a borda de retorno ao Servidor é a esquerda ('left')
 const RETURN_EDGE = parseEdge(process.env.RETURN_EDGE, 'left');
 
-// Candidatos de conexão: host informado, variante .local (mDNS) e IPs extras opcionais
 const isIp = net.isIP(SERVER_HOST) !== 0;
 const HOSTS = Array.from(
   new Set(
     [
       SERVER_HOST,
       !isIp && !SERVER_HOST.endsWith('.local') ? `${SERVER_HOST}.local` : '',
-      ...(process.env.SERVER_FALLBACK_HOSTS ?? '192.168.1.15').split(','),
+      ...(process.env.SERVER_FALLBACK_HOSTS ?? '192.168.1.15,192.168.1.14').split(','),
     ]
       .map((h) => h.trim())
       .filter(Boolean)
@@ -34,6 +32,11 @@ class KVMClient {
       this.active = false;
       console.log('[Cliente] Borda de retorno atingida -> devolvendo controle ao Servidor.');
       this.send({ type: 'return', yRatio });
+    });
+    injector.on('pos', (pos: { x: number; y: number }) => {
+      if (this.active) {
+        this.send({ type: 'client_pos', x: pos.x, y: pos.y });
+      }
     });
     injector.on('exit', (code: number) => {
       console.error(`[Cliente] Injetor encerrou (código ${code}). Saindo.`);
@@ -62,7 +65,12 @@ class KVMClient {
       socket.setNoDelay(true);
       socket.setKeepAlive(true, 2000);
       this.socket = socket;
-      console.log(`[Cliente] Conectado ao Servidor ${host}:${SERVER_PORT}. Borda de retorno: ${RETURN_EDGE}.`);
+      console.log(`[Cliente] Conectado ao Servidor ${host}:${SERVER_PORT}.`);
+      this.send({
+        type: 'client_info',
+        width: this.injector.screenWidth,
+        height: this.injector.screenHeight,
+      });
     });
 
     const reader = new LineReader((line) => {
@@ -81,7 +89,7 @@ class KVMClient {
         this.active = false;
         this.injector.leave();
       }
-      if (!connected) this.hostIndex++; // tenta o próximo candidato
+      if (!connected) this.hostIndex++;
       console.log('[Cliente] Desconectado. Nova tentativa em 2s...');
       setTimeout(() => this.connect(), 2000);
     });
@@ -89,7 +97,14 @@ class KVMClient {
 
   private handle(packet: Packet) {
     switch (packet.type) {
+      case 'config':
+        this.injector.setReturnEdge(packet.returnEdge);
+        console.log(`[Cliente] Borda de retorno atualizada pelo Servidor: ${packet.returnEdge.toUpperCase()}`);
+        break;
       case 'enter':
+        if (packet.returnEdge) {
+          this.injector.setReturnEdge(packet.returnEdge);
+        }
         this.active = true;
         this.injector.enter(packet.yRatio);
         console.log('[Cliente] Controle recebido.');
@@ -98,7 +113,7 @@ class KVMClient {
         if (this.active) {
           this.active = false;
           this.injector.leave();
-          console.log('[Cliente] Controle devolvido ao Servidor (ScrollLock).');
+          console.log('[Cliente] Controle devolvido ao Servidor.');
         }
         break;
       case 'move':

@@ -4,17 +4,11 @@ import path from 'path';
 import { Edge, InputPacket, LineReader } from './protocol';
 import { SCRIPTS_DIR, detectLinuxScreen, ensureLinuxDeviceAccess } from './platform';
 
-/**
- * Captura de entrada no SERVIDOR.
- * Eventos emitidos:
- *  - 'edge' (yRatio)    : cursor local cruzou a borda configurada
- *  - 'input' (packet)   : evento de mouse/teclado a ser enviado ao cliente (só enquanto remoto)
- *  - 'emergency'        : usuário pressionou ScrollLock e a captura voltou ao servidor
- *  - 'exit' (code)      : captura encerrou
- */
 export interface Capture extends EventEmitter {
-  start(): Promise<void>;
+  start(): Promise<{ width: number; height: number }>;
   setRemote(on: boolean, yRatio?: number): void;
+  updateConfig(cfg: Partial<CaptureOptions>): void;
+  centerCursor(): void;
   stop(): void;
 }
 
@@ -28,18 +22,15 @@ export function createCapture(options: CaptureOptions): Capture {
   return process.platform === 'linux' ? new LinuxCapture(options) : new GenericCapture(options);
 }
 
-// ---------------------------------------------------------------------------
-// Linux (Wayland e X11): evdev + uinput através de scripts/linux_capture.py
-// ---------------------------------------------------------------------------
 class LinuxCapture extends EventEmitter implements Capture {
   private proc: ChildProcess | null = null;
   private readonly script = path.join(SCRIPTS_DIR, 'linux_capture.py');
 
-  constructor(private readonly options: CaptureOptions) {
+  constructor(private options: CaptureOptions) {
     super();
   }
 
-  async start(): Promise<void> {
+  async start(): Promise<{ width: number; height: number }> {
     const list = spawnSync('python3', [this.script, '--list'], { encoding: 'utf8' });
     if (list.error || list.status !== 0) {
       throw new Error(`Falha ao executar python3 (${list.error?.message ?? list.stderr}). Instale o python3.`);
@@ -50,7 +41,7 @@ class LinuxCapture extends EventEmitter implements Capture {
     const { width, height } = detectLinuxScreen();
     const config = JSON.stringify({ width, height, ...this.options });
 
-    await new Promise<void>((resolve, reject) => {
+    return await new Promise<{ width: number; height: number }>((resolve, reject) => {
       const proc = spawn('python3', [this.script, config], { stdio: ['pipe', 'pipe', 'inherit'] });
       this.proc = proc;
       let ready = false;
@@ -68,10 +59,13 @@ class LinuxCapture extends EventEmitter implements Capture {
             console.log(`[Captura] Tela ${msg.width}x${msg.height}`);
             console.log(`[Captura] Mouses: ${msg.mice.join(', ')}`);
             console.log(`[Captura] Teclados: ${msg.keyboards.join(', ')}`);
-            resolve();
+            resolve({ width: Number(msg.width), height: Number(msg.height) });
             break;
           case 'edge':
             this.emit('edge', Number(msg.yRatio));
+            break;
+          case 'pos':
+            this.emit('pos', { x: Number(msg.x), y: Number(msg.y) });
             break;
           case 'emergency':
             this.emit('emergency');
@@ -101,17 +95,20 @@ class LinuxCapture extends EventEmitter implements Capture {
     this.proc?.stdin?.write(JSON.stringify({ cmd: 'remote', on, yRatio }) + '\n');
   }
 
+  updateConfig(cfg: Partial<CaptureOptions>): void {
+    this.options = { ...this.options, ...cfg };
+    this.proc?.stdin?.write(JSON.stringify({ cmd: 'config', ...cfg }) + '\n');
+  }
+
+  centerCursor(): void {
+    this.proc?.stdin?.write(JSON.stringify({ cmd: 'center' }) + '\n');
+  }
+
   stop(): void {
     this.proc?.kill();
   }
 }
 
-// ---------------------------------------------------------------------------
-// Windows / macOS (experimental): uiohook-napi + nut-js
-// Limitação: não bloqueia os eventos locais (cliques também acontecem no servidor).
-// ---------------------------------------------------------------------------
-
-/** Converte keycode do uiohook (scancode set 1) para o código evdev canônico do protocolo. */
 function uiohookToEvdev(code: number): number | undefined {
   const extended: Record<number, number> = {
     0x1c: 96, 0x1d: 97, 0x35: 98, 0x37: 99, 0x38: 100, 0x47: 102, 0x48: 103, 0x49: 104,
@@ -134,11 +131,11 @@ class GenericCapture extends EventEmitter implements Capture {
   private hook: any;
   private nut: any;
 
-  constructor(private readonly options: CaptureOptions) {
+  constructor(private options: CaptureOptions) {
     super();
   }
 
-  async start(): Promise<void> {
+  async start(): Promise<{ width: number; height: number }> {
     this.nut = require('@nut-tree-fork/nut-js');
     const { uIOhook } = require('uiohook-napi');
     this.hook = uIOhook;
@@ -166,7 +163,7 @@ class GenericCapture extends EventEmitter implements Capture {
     uIOhook.on('keydown', onKey(true));
     uIOhook.on('keyup', onKey(false));
     uIOhook.start();
-    console.log(`[Captura] uiohook ativo (${this.width}x${this.height}) - modo experimental.`);
+    return { width: this.width, height: this.height };
   }
 
   private forward(packet: InputPacket) {
@@ -187,8 +184,17 @@ class GenericCapture extends EventEmitter implements Capture {
     const cx = Math.floor(this.width / 2);
     const cy = Math.floor(this.height / 2);
     if (!this.remote) {
-      const hit = this.options.edge === 'right' ? x >= this.width - 1 : x <= 0;
-      if (hit) this.emit('edge', y / (this.height - 1));
+      this.emit('pos', { x, y });
+      const e = this.options.edge;
+      const hit =
+        (e === 'right' && x >= this.width - 1) ||
+        (e === 'left' && x <= 0) ||
+        (e === 'top' && y <= 0) ||
+        (e === 'bottom' && y >= this.height - 1);
+      if (hit) {
+        const ratio = e === 'left' || e === 'right' ? y / (this.height - 1) : x / (this.width - 1);
+        this.emit('edge', ratio);
+      }
       return;
     }
     const dx = x - cx;
@@ -203,9 +209,19 @@ class GenericCapture extends EventEmitter implements Capture {
     if (on) {
       void this.warp(Math.floor(this.width / 2), Math.floor(this.height / 2));
     } else {
-      const x = this.options.edge === 'right' ? this.width - 3 : 2;
-      void this.warp(x, Math.round(yRatio * (this.height - 1)));
+      const e = this.options.edge;
+      const x = e === 'right' ? this.width - 40 : e === 'left' ? 40 : Math.round(yRatio * (this.width - 1));
+      const y = e === 'bottom' ? this.height - 40 : e === 'top' ? 40 : Math.round(yRatio * (this.height - 1));
+      void this.warp(x, y);
     }
+  }
+
+  updateConfig(cfg: Partial<CaptureOptions>): void {
+    this.options = { ...this.options, ...cfg };
+  }
+
+  centerCursor(): void {
+    void this.warp(Math.floor(this.width / 2), Math.floor(this.height / 2));
   }
 
   stop(): void {

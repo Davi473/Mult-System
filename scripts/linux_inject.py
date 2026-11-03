@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
 """
 Injetor de mouse/teclado do CLIENTE KVM no Linux (Wayland e X11) via /dev/uinput.
-
-Mesmo protocolo de texto do win_injector.ps1:
-  stdin : e <yRatio> | m <dx> <dy> | b <botao> <0|1> | w <dy> <dx> | k <codigo evdev> <0|1> | l
-  stdout: ready <largura>x<altura> | r <yRatio>
+Suporta bordas left, right, top, bottom, cooldown anti-ping-pong e telemetria p <x> <y>.
 """
 import fcntl
 import json
 import os
 import struct
 import sys
+import time
 
 UI_SET_EVBIT = 0x40045564
 UI_SET_KEYBIT = 0x40045565
@@ -37,17 +35,19 @@ def create_device(name, setup, absmax=None):
     if absmax:
         amax[ABS_X], amax[ABS_Y] = absmax
     zeros = [0] * 64
-    os.write(fd, struct.pack("80sHHHHI64i64i64i64i", name.encode(), 0x03, 0x1234, 0x5680, 1, 0,
-                             *amax, *zeros, *zeros, *zeros))
+    os.write(
+        fd,
+        struct.pack("80sHHHHI64i64i64i64i", name.encode(), 0x03, 0x1234, 0x5680, 1, 0, *amax, *zeros, *zeros, *zeros),
+    )
     fcntl.ioctl(fd, UI_DEV_CREATE)
     return fd
 
 
 def main():
-    cfg = json.loads(sys.argv[1]) if len(sys.argv) > 1 else {}
+    cfg = json.loads(sys.argv[1]) if len(sys.argv[1:]) else {}
     width = int(cfg.get("width", 1920))
     height = int(cfg.get("height", 1080))
-    return_left = cfg.get("edge", "left") != "right"
+    return_edge = cfg.get("edge", "left")
 
     def setup_keyboard(fd):
         fcntl.ioctl(fd, UI_SET_EVBIT, EV_SYN)
@@ -77,6 +77,8 @@ def main():
 
     active = False
     x, y = width // 2, height // 2
+    cooldown_until = 0.0
+    last_pos = 0.0
     pressed_keys, pressed_buttons = set(), set()
 
     def release_all():
@@ -94,26 +96,58 @@ def main():
             if not p:
                 continue
             cmd = p[0]
-            if cmd == "e":
+            if cmd == "c":
+                return_edge = p[1].strip().lower()
+            elif cmd == "e":
                 active = True
-                x = 2 if return_left else width - 3
-                y = min(max(int(float(p[1]) * (height - 1)), 0), height - 1)
+                r = min(max(float(p[1]), 0.0), 1.0)
+                offset = 40
+                if return_edge == "left":
+                    x, y = offset, int(r * (height - 1))
+                elif return_edge == "right":
+                    x, y = width - 1 - offset, int(r * (height - 1))
+                elif return_edge == "top":
+                    x, y = int(r * (width - 1)), offset
+                else:
+                    x, y = int(r * (width - 1)), height - 1 - offset
+                cooldown_until = time.monotonic() + 0.30
                 write(ptr, ev(EV_ABS, ABS_X, x), ev(EV_ABS, ABS_Y, y))
+                out("p %d %d" % (x, y))
             elif cmd == "l":
                 active = False
                 release_all()
             elif not active:
                 continue
             elif cmd == "m":
-                nx = x + int(p[1])
-                y = min(max(y + int(p[2]), 0), height - 1)
-                if (return_left and nx < 0) or (not return_left and nx > width - 1):
-                    active = False
-                    release_all()
-                    out("r %.4f" % (y / float(height - 1)))
-                    continue
+                dx, dy = int(p[1]), int(p[2])
+                nx, ny = x + dx, y + dy
+                now = time.monotonic()
+                if now >= cooldown_until:
+                    hit = False
+                    ratio = 0.5
+                    if return_edge == "left" and nx <= 0 and dx < 0:
+                        hit = True
+                        ratio = min(max(ny, 0), height - 1) / float(max(1, height - 1))
+                    elif return_edge == "right" and nx >= width - 1 and dx > 0:
+                        hit = True
+                        ratio = min(max(ny, 0), height - 1) / float(max(1, height - 1))
+                    elif return_edge == "top" and ny <= 0 and dy < 0:
+                        hit = True
+                        ratio = min(max(nx, 0), width - 1) / float(max(1, width - 1))
+                    elif return_edge == "bottom" and ny >= height - 1 and dy > 0:
+                        hit = True
+                        ratio = min(max(nx, 0), width - 1) / float(max(1, width - 1))
+                    if hit:
+                        active = False
+                        release_all()
+                        out("r %.4f" % ratio)
+                        continue
                 x = min(max(nx, 0), width - 1)
+                y = min(max(ny, 0), height - 1)
                 write(ptr, ev(EV_ABS, ABS_X, x), ev(EV_ABS, ABS_Y, y))
+                if now - last_pos >= 0.033:
+                    last_pos = now
+                    out("p %d %d" % (x, y))
             elif cmd == "b":
                 code = BUTTONS.get(int(p[1]))
                 if code:

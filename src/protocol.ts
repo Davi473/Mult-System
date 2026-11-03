@@ -1,18 +1,31 @@
 import fs from 'fs';
 import path from 'path';
 
-export type Edge = 'left' | 'right';
+export type Edge = 'left' | 'right' | 'top' | 'bottom';
+
+export function oppositeEdge(edge: Edge): Edge {
+  switch (edge) {
+    case 'right':
+      return 'left';
+    case 'left':
+      return 'right';
+    case 'top':
+      return 'bottom';
+    case 'bottom':
+      return 'top';
+  }
+}
 
 /**
  * Pacotes trocados entre Servidor e Cliente (NDJSON: um JSON por linha).
- * Teclas usam SEMPRE o código evdev do Linux (ex: A=30, Enter=28) como formato canônico.
- * Botões: 1=esquerdo, 2=direito, 3=meio, 4=voltar, 5=avançar.
- * Roda: dy/dx em "cliques" (positivo = cima / direita).
  */
 export type Packet =
-  | { type: 'enter'; yRatio: number } // servidor -> cliente: controle entrou no cliente
-  | { type: 'leave' } // servidor -> cliente: controle voltou ao servidor (ex: ScrollLock)
-  | { type: 'return'; yRatio: number } // cliente -> servidor: cursor atingiu a borda de retorno
+  | { type: 'enter'; yRatio: number; returnEdge?: Edge }
+  | { type: 'leave' }
+  | { type: 'config'; returnEdge: Edge }
+  | { type: 'return'; yRatio: number }
+  | { type: 'client_info'; width: number; height: number }
+  | { type: 'client_pos'; x: number; y: number }
   | { type: 'move'; dx: number; dy: number }
   | { type: 'button'; button: number; down: boolean }
   | { type: 'wheel'; dy: number; dx: number }
@@ -43,7 +56,10 @@ export class LineReader {
 
 export function parseEdge(value: string | undefined, fallback: Edge): Edge {
   const v = value?.trim().toLowerCase();
-  return v === 'left' || v === 'right' ? v : fallback;
+  if (v === 'left' || v === 'right' || v === 'top' || v === 'bottom') {
+    return v;
+  }
+  return fallback;
 }
 
 /**
@@ -65,4 +81,38 @@ export function loadEnv(): void {
       process.env[key] = value;
     }
   }
+}
+
+/**
+ * Salva/atualiza chaves no arquivo .env na raiz do projeto
+ */
+export function saveEnv(updates: Record<string, string | number>): void {
+  const envPath = path.resolve(process.cwd(), '.env');
+  let lines: string[] = [];
+  if (fs.existsSync(envPath)) {
+    lines = fs.readFileSync(envPath, 'utf-8').split(/\r?\n/);
+  }
+  const remaining = new Map<string, string>(
+    Object.entries(updates).map(([k, v]) => [k, String(v)])
+  );
+
+  const updatedLines = lines.map((rawLine) => {
+    const line = rawLine.trim();
+    if (!line || line.startsWith('#')) return rawLine;
+    const eqIndex = line.indexOf('=');
+    if (eqIndex === -1) return rawLine;
+    const key = line.slice(0, eqIndex).trim();
+    if (remaining.has(key)) {
+      const val = remaining.get(key)!;
+      remaining.delete(key);
+      return `${key}=${val}`;
+    }
+    return rawLine;
+  });
+
+  for (const [k, v] of remaining.entries()) {
+    updatedLines.push(`${k}=${v}`);
+  }
+
+  fs.writeFileSync(envPath, updatedLines.join('\n'), 'utf-8');
 }

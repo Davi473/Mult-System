@@ -1,20 +1,19 @@
 <#
-  Injetor de mouse/teclado do CLIENTE KVM no Windows.
+  Injetor de mouse/teclado do CLIENTE KVM no Windows 11/10.
 
-  Lê comandos de texto pelo stdin (um por linha) e injeta via SendInput (Win32):
-    e <yRatio>        -> controle entrou: posiciona o cursor na borda de entrada
+  Comandos via stdin:
+    e <ratio>         -> controle entrou: posiciona o cursor a 40px da borda de entrada
+    c <edge>          -> atualiza a borda de retorno (left, right, top, bottom)
     m <dx> <dy>       -> movimento relativo
     b <botao> <0|1>   -> botão (1=esq, 2=dir, 3=meio, 4=voltar, 5=avançar)
-    w <dy> <dx>       -> rolagem (em "cliques" da roda; positivo = cima/direita)
-    k <codigo> <0|1>  -> tecla (código evdev do Linux, convertido para scancode)
-    l                 -> controle saiu: solta todas as teclas/botões pressionados
+    w <dy> <dx>       -> rolagem
+    k <codigo> <0|1>  -> tecla (código evdev do Linux -> scancode Win32)
+    l                 -> controle saiu: solta todas as teclas/botões
 
-  Escreve no stdout:
+  Saída via stdout:
     ready <largura>x<altura>
-    r <yRatio>        -> cursor atingiu a borda de retorno (devolver ao servidor)
-
-  Teclas são enviadas por SCANCODE (independente do layout), então o layout
-  ABNT2 / US configurado no Windows é respeitado.
+    r <ratio>         -> cursor atingiu a borda de retorno (devolver ao servidor)
+    p <x> <y>         -> posição atual do cursor no cliente (para o Frontend visual)
 #>
 param([string]$ReturnEdge = 'left')
 
@@ -42,11 +41,7 @@ public static class KvmInjector
     [StructLayout(LayoutKind.Sequential)]
     private struct INPUT { public uint type; public INPUTUNION u; }
 
-    [StructLayout(LayoutKind.Sequential)]
-    private struct POINT { public int X; public int Y; }
-
     [DllImport("user32.dll", SetLastError = true)] private static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
-    [DllImport("user32.dll")] private static extern bool GetCursorPos(out POINT lpPoint);
     [DllImport("user32.dll")] private static extern bool SetCursorPos(int x, int y);
     [DllImport("user32.dll")] private static extern int GetSystemMetrics(int nIndex);
     [DllImport("user32.dll")] private static extern bool SetProcessDPIAware();
@@ -56,44 +51,24 @@ public static class KvmInjector
     private const uint MOUSEEVENTF_MOVE = 0x0001;
     private const uint MOUSEEVENTF_WHEEL = 0x0800;
     private const uint MOUSEEVENTF_HWHEEL = 0x1000;
+    private const uint MOUSEEVENTF_VIRTUALDESK = 0x4000;
+    private const uint MOUSEEVENTF_ABSOLUTE = 0x8000;
     private const uint KEYEVENTF_EXTENDEDKEY = 0x0001;
     private const uint KEYEVENTF_KEYUP = 0x0002;
     private const uint KEYEVENTF_SCANCODE = 0x0008;
 
-    // evdev -> scancode estendido (prefixo E0)
     private static readonly Dictionary<int, int> Extended = new Dictionary<int, int>
     {
-        { 96, 0x1C },  // KP Enter
-        { 97, 0x1D },  // Ctrl direito
-        { 98, 0x35 },  // KP /
-        { 99, 0x37 },  // PrintScreen
-        { 100, 0x38 }, // Alt direito / AltGr
-        { 102, 0x47 }, // Home
-        { 103, 0x48 }, // Cima
-        { 104, 0x49 }, // PageUp
-        { 105, 0x4B }, // Esquerda
-        { 106, 0x4D }, // Direita
-        { 107, 0x4F }, // End
-        { 108, 0x50 }, // Baixo
-        { 109, 0x51 }, // PageDown
-        { 110, 0x52 }, // Insert
-        { 111, 0x53 }, // Delete
-        { 125, 0x5B }, // Windows esquerdo
-        { 126, 0x5C }, // Windows direito
-        { 127, 0x5D }, // Menu
+        { 96, 0x1C }, { 97, 0x1D }, { 98, 0x35 }, { 99, 0x37 }, { 100, 0x38 },
+        { 102, 0x47 }, { 103, 0x48 }, { 104, 0x49 }, { 105, 0x4B }, { 106, 0x4D },
+        { 107, 0x4F }, { 108, 0x50 }, { 109, 0x51 }, { 110, 0x52 }, { 111, 0x53 },
+        { 125, 0x5B }, { 126, 0x5C }, { 127, 0x5D },
     };
 
-    // evdev -> Virtual Key (teclas de mídia e Pause)
     private static readonly Dictionary<int, int> VirtualKeys = new Dictionary<int, int>
     {
-        { 113, 0xAD }, // Mudo
-        { 114, 0xAE }, // Volume -
-        { 115, 0xAF }, // Volume +
-        { 119, 0x13 }, // Pause
-        { 163, 0xB0 }, // Próxima faixa
-        { 164, 0xB3 }, // Play/Pause
-        { 165, 0xB1 }, // Faixa anterior
-        { 166, 0xB2 }, // Stop
+        { 113, 0xAD }, { 114, 0xAE }, { 115, 0xAF }, { 119, 0x13 },
+        { 163, 0xB0 }, { 164, 0xB3 }, { 165, 0xB1 }, { 166, 0xB2 },
     };
 
     private static readonly HashSet<int> PressedKeys = new HashSet<int>();
@@ -101,8 +76,11 @@ public static class KvmInjector
     private static readonly int InputSize = Marshal.SizeOf(typeof(INPUT));
     private static StreamWriter output;
     private static bool active;
-    private static bool returnLeft = true;
+    private static string returnEdge = "left";
     private static int vx, vy, vw, vh;
+    private static int curX, curY;
+    private static long cooldownUntilTick;
+    private static long lastPosTick;
 
     private static void Send(INPUT input)
     {
@@ -120,37 +98,109 @@ public static class KvmInjector
         Send(i);
     }
 
+    private static void MoveCursorAbsolute(int x, int y)
+    {
+        SetCursorPos(x, y);
+        int normX = vw > 1 ? (int)Math.Round(((double)(x - vx) * 65535.0) / (vw - 1)) : 0;
+        int normY = vh > 1 ? (int)Math.Round(((double)(y - vy) * 65535.0) / (vh - 1)) : 0;
+        Mouse(normX, normY, 0, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK);
+    }
+
     private static void RefreshBounds()
     {
-        vx = GetSystemMetrics(76); // SM_XVIRTUALSCREEN
-        vy = GetSystemMetrics(77); // SM_YVIRTUALSCREEN
-        vw = GetSystemMetrics(78); // SM_CXVIRTUALSCREEN
-        vh = GetSystemMetrics(79); // SM_CYVIRTUALSCREEN
+        vx = GetSystemMetrics(76);
+        vy = GetSystemMetrics(77);
+        vw = GetSystemMetrics(78);
+        vh = GetSystemMetrics(79);
+        if (vw <= 0) vw = GetSystemMetrics(0);
+        if (vh <= 0) vh = GetSystemMetrics(1);
     }
 
     private static void Enter(double ratio)
     {
         RefreshBounds();
-        int x = returnLeft ? vx + 3 : vx + vw - 4;
-        int y = vy + (int)Math.Round(Math.Max(0.0, Math.Min(1.0, ratio)) * (vh - 1));
-        SetCursorPos(x, y);
+        double r = Math.Max(0.0, Math.Min(1.0, ratio));
+        int offset = 40;
+
+        if (returnEdge == "left")
+        {
+            curX = vx + offset;
+            curY = vy + (int)Math.Round(r * (vh - 1));
+        }
+        else if (returnEdge == "right")
+        {
+            curX = vx + vw - 1 - offset;
+            curY = vy + (int)Math.Round(r * (vh - 1));
+        }
+        else if (returnEdge == "top")
+        {
+            curX = vx + (int)Math.Round(r * (vw - 1));
+            curY = vy + offset;
+        }
+        else
+        {
+            curX = vx + (int)Math.Round(r * (vw - 1));
+            curY = vy + vh - 1 - offset;
+        }
+
+        curX = Math.Max(vx, Math.Min(vx + vw - 1, curX));
+        curY = Math.Max(vy, Math.Min(vy + vh - 1, curY));
+        cooldownUntilTick = Environment.TickCount + 300;
         active = true;
+        MoveCursorAbsolute(curX, curY);
+        output.WriteLine("p " + (curX - vx) + " " + (curY - vy));
     }
 
     private static void Move(int dx, int dy)
     {
         if (!active) return;
-        Mouse(dx, dy, 0, MOUSEEVENTF_MOVE);
 
-        POINT p;
-        GetCursorPos(out p);
-        bool hit = returnLeft ? (p.X <= vx && dx < 0) : (p.X >= vx + vw - 1 && dx > 0);
-        if (hit)
+        int nx = curX + dx;
+        int ny = curY + dy;
+        long now = Environment.TickCount;
+
+        if (now - cooldownUntilTick >= 0)
         {
-            active = false;
-            ReleaseAll();
-            double ratio = vh > 1 ? (double)(p.Y - vy) / (vh - 1) : 0.5;
-            output.WriteLine("r " + ratio.ToString("0.0000", CultureInfo.InvariantCulture));
+            bool hit = false;
+            double ratio = 0.5;
+            if (returnEdge == "left" && nx <= vx && dx < 0)
+            {
+                hit = true;
+                ratio = vh > 1 ? (double)(Math.Max(vy, Math.Min(vy + vh - 1, ny)) - vy) / (vh - 1) : 0.5;
+            }
+            else if (returnEdge == "right" && nx >= vx + vw - 1 && dx > 0)
+            {
+                hit = true;
+                ratio = vh > 1 ? (double)(Math.Max(vy, Math.Min(vy + vh - 1, ny)) - vy) / (vh - 1) : 0.5;
+            }
+            else if (returnEdge == "top" && ny <= vy && dy < 0)
+            {
+                hit = true;
+                ratio = vw > 1 ? (double)(Math.Max(vx, Math.Min(vx + vw - 1, nx)) - vx) / (vw - 1) : 0.5;
+            }
+            else if (returnEdge == "bottom" && ny >= vy + vh - 1 && dy > 0)
+            {
+                hit = true;
+                ratio = vw > 1 ? (double)(Math.Max(vx, Math.Min(vx + vw - 1, nx)) - vx) / (vw - 1) : 0.5;
+            }
+
+            if (hit)
+            {
+                active = false;
+                ReleaseAll();
+                output.WriteLine("r " + ratio.ToString("0.0000", CultureInfo.InvariantCulture));
+                return;
+            }
+        }
+
+        curX = Math.Max(vx, Math.Min(vx + vw - 1, nx));
+        curY = Math.Max(vy, Math.Min(vy + vh - 1, ny));
+        MoveCursorAbsolute(curX, curY);
+
+        if (now - lastPosTick >= 33)
+        {
+            lastPosTick = now;
+            output.WriteLine("p " + (curX - vx) + " " + (curY - vy));
         }
     }
 
@@ -192,9 +242,9 @@ public static class KvmInjector
         else
         {
             bool ext = false;
-            if (code >= 1 && code <= 88) scan = code;          // mesmo valor do scancode set 1
-            else if (code == 89) scan = 0x73;                  // KEY_RO  (ABNT2: tecla / ?)
-            else if (code == 121) scan = 0x7E;                 // KEY_KPCOMMA (ABNT2: . do numpad)
+            if (code >= 1 && code <= 88) scan = code;
+            else if (code == 89) scan = 0x73;
+            else if (code == 121) scan = 0x7E;
             else if (Extended.TryGetValue(code, out scan)) ext = true;
             else return;
 
@@ -221,6 +271,7 @@ public static class KvmInjector
         switch (p[0])
         {
             case "e": Enter(D(p[1])); break;
+            case "c": returnEdge = p[1].Trim().ToLowerInvariant(); break;
             case "m": Move(I(p[1]), I(p[2])); break;
             case "b": if (active) Button(I(p[1]), p[2] == "1"); break;
             case "w": if (active) Wheel(I(p[1]), I(p[2])); break;
@@ -231,9 +282,11 @@ public static class KvmInjector
 
     public static void Run(string edge)
     {
-        returnLeft = edge != "right";
+        returnEdge = edge.Trim().ToLowerInvariant();
         SetProcessDPIAware();
         RefreshBounds();
+        curX = vx + vw / 2;
+        curY = vy + vh / 2;
 
         output = new StreamWriter(Console.OpenStandardOutput(), new UTF8Encoding(false));
         output.AutoFlush = true;

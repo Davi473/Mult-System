@@ -1,38 +1,116 @@
 import net from 'net';
 import { createCapture } from './capture';
-import { Packet, LineReader, encode, loadEnv, parseEdge } from './protocol';
+import { WebDashboard, KVMState } from './frontend';
+import { Edge, Packet, LineReader, encode, loadEnv, saveEnv, parseEdge, oppositeEdge } from './protocol';
 
 loadEnv();
 
 const PORT = Number(process.env.KVM_PORT) || 5000;
-// Em qual borda do Servidor o monitor do Cliente está posicionado ('right' ou 'left')
-const CLIENT_EDGE = parseEdge(process.env.CLIENT_EDGE, 'right');
-// Velocidade/aceleração do cursor LOCAL no Linux (o cursor local é movido pelo próprio KVM)
-const MOUSE_SPEED = Number(process.env.MOUSE_SPEED) || 1.0;
-const MOUSE_ACCEL = process.env.MOUSE_ACCEL !== undefined ? Number(process.env.MOUSE_ACCEL) : 1.0;
+const UI_PORT = Number(process.env.UI_PORT) || 8080;
 
 async function main() {
-  const capture = createCapture({ edge: CLIENT_EDGE, speed: MOUSE_SPEED, accel: MOUSE_ACCEL });
+  let clientEdge: Edge = parseEdge(process.env.CLIENT_EDGE, 'right');
+  let mouseSpeed = Number(process.env.MOUSE_SPEED) || 1.0;
+  let mouseAccel = process.env.MOUSE_ACCEL !== undefined ? Number(process.env.MOUSE_ACCEL) : 1.0;
+
+  const capture = createCapture({ edge: clientEdge, speed: mouseSpeed, accel: mouseAccel });
   let client: net.Socket | null = null;
+  let clientAddress: string | null = null;
   let remote = false;
+
+  let serverScreen = { width: 1920, height: 1080 };
+  let clientScreen = { width: 1920, height: 1080 };
+  let cursor: KVMState['cursor'] = { screen: 'server', x: 960, y: 540 };
 
   const send = (packet: Packet) => {
     if (client && !client.destroyed) client.write(encode(packet));
   };
 
+  const dashboard = new WebDashboard(UI_PORT, {
+    getState: () => ({
+      clientConnected: client !== null && !client.destroyed,
+      clientAddress,
+      remoteActive: remote,
+      clientEdge,
+      mouseSpeed,
+      mouseAccel,
+      serverScreen,
+      clientScreen,
+      cursor,
+    }),
+    onUpdateConfig: (cfg) => {
+      if (cfg.edge) {
+        clientEdge = parseEdge(cfg.edge, clientEdge);
+        const returnEdge = oppositeEdge(clientEdge);
+        send({ type: 'config', returnEdge });
+        saveEnv({ CLIENT_EDGE: clientEdge, RETURN_EDGE: returnEdge });
+        console.log(`[Servidor] Layout alterado: Cliente posicionado em ${clientEdge.toUpperCase()} (retorno: ${returnEdge.toUpperCase()})`);
+      }
+      if (cfg.speed !== undefined) {
+        mouseSpeed = Number(cfg.speed) || 1.0;
+        saveEnv({ MOUSE_SPEED: mouseSpeed });
+      }
+      if (cfg.accel !== undefined) {
+        mouseAccel = Number(cfg.accel);
+        saveEnv({ MOUSE_ACCEL: mouseAccel });
+      }
+      capture.updateConfig({ edge: clientEdge, speed: mouseSpeed, accel: mouseAccel });
+    },
+    onForceSwitch: (toRemote: boolean) => {
+      if (toRemote && client && !remote) {
+        remote = true;
+        capture.setRemote(true);
+        const returnEdge = oppositeEdge(clientEdge);
+        send({ type: 'enter', yRatio: 0.5, returnEdge });
+        cursor = { screen: 'client', x: clientScreen.width / 2, y: clientScreen.height / 2 };
+        console.log('[Servidor] Alternância manual pelo painel -> Cliente ativo.');
+      } else if (!toRemote && remote) {
+        remote = false;
+        capture.setRemote(false, 0.5);
+        send({ type: 'leave' });
+        cursor = { screen: 'server', x: serverScreen.width / 2, y: serverScreen.height / 2 };
+        console.log('[Servidor] Alternância manual pelo painel -> Servidor ativo.');
+      }
+    },
+    onCenterCursor: () => {
+      if (remote) {
+        remote = false;
+        capture.setRemote(false, 0.5);
+        send({ type: 'leave' });
+      }
+      capture.centerCursor();
+      cursor = { screen: 'server', x: serverScreen.width / 2, y: serverScreen.height / 2 };
+    },
+  });
+
   const backToServer = (yRatio: number, reason: string) => {
     if (!remote) return;
     remote = false;
     capture.setRemote(false, yRatio);
+    cursor = {
+      screen: 'server',
+      x: clientEdge === 'right' ? serverScreen.width - 40 : clientEdge === 'left' ? 40 : Math.round(yRatio * serverScreen.width),
+      y: clientEdge === 'bottom' ? serverScreen.height - 40 : clientEdge === 'top' ? 40 : Math.round(yRatio * serverScreen.height),
+    };
     console.log(`[Servidor] Controle de volta no Servidor (${reason}).`);
+    dashboard.broadcast();
   };
 
   capture.on('edge', (yRatio: number) => {
     if (!client || remote) return;
     remote = true;
     capture.setRemote(true);
-    send({ type: 'enter', yRatio });
-    console.log('[Servidor] Borda atingida -> controle transferido para o Cliente.');
+    const returnEdge = oppositeEdge(clientEdge);
+    send({ type: 'enter', yRatio, returnEdge });
+    console.log(`[Servidor] Borda (${clientEdge}) atingida -> controle transferido para o Cliente.`);
+    dashboard.broadcast();
+  });
+
+  capture.on('pos', (pos: { x: number; y: number }) => {
+    if (!remote) {
+      cursor = { screen: 'server', x: pos.x, y: pos.y };
+      dashboard.broadcast();
+    }
   });
 
   capture.on('input', (packet: Packet) => {
@@ -43,7 +121,9 @@ async function main() {
     if (!remote) return;
     remote = false;
     send({ type: 'leave' });
+    cursor = { screen: 'server', x: serverScreen.width / 2, y: serverScreen.height / 2 };
     console.log('[Servidor] ScrollLock -> controle de volta no Servidor.');
+    dashboard.broadcast();
   });
 
   capture.on('exit', (code: number) => {
@@ -51,7 +131,9 @@ async function main() {
     process.exit(code === 3 ? 0 : 1);
   });
 
-  await capture.start();
+  serverScreen = await capture.start();
+  cursor = { screen: 'server', x: Math.floor(serverScreen.width / 2), y: Math.floor(serverScreen.height / 2) };
+  dashboard.start();
 
   const server = net.createServer((socket) => {
     if (client) {
@@ -59,18 +141,33 @@ async function main() {
       client.destroy();
     }
     client = socket;
-    socket.setNoDelay(true); // Desativa algoritmo de Nagle para menor latência
+    clientAddress = `${socket.remoteAddress?.replace('::ffff:', '')}:${socket.remotePort}`;
+    socket.setNoDelay(true);
     socket.setKeepAlive(true, 2000);
-    console.log(`[Servidor] Cliente conectado: ${socket.remoteAddress}:${socket.remotePort}`);
+    console.log(`[Servidor] Cliente conectado: ${clientAddress}`);
+
+    // Envia imediatamente a borda de retorno configurada para sincronizar o Cliente
+    send({ type: 'config', returnEdge: oppositeEdge(clientEdge) });
+    dashboard.broadcast();
 
     const reader = new LineReader((line) => {
-      let packet: Packet;
+      let packet: any;
       try {
         packet = JSON.parse(line);
       } catch {
         return;
       }
-      if (packet.type === 'return') backToServer(packet.yRatio, 'borda do cliente');
+      if (packet.type === 'return' || packet.type === 'return_server') {
+        backToServer(Number(packet.yRatio ?? 0.5), 'borda do cliente');
+      } else if (packet.type === 'client_info') {
+        clientScreen = { width: Number(packet.width) || 1920, height: Number(packet.height) || 1080 };
+        dashboard.broadcast();
+      } else if (packet.type === 'client_pos') {
+        if (remote) {
+          cursor = { screen: 'client', x: Number(packet.x) || 0, y: Number(packet.y) || 0 };
+          dashboard.broadcast();
+        }
+      }
     });
 
     socket.on('data', (chunk) => reader.push(chunk));
@@ -78,14 +175,16 @@ async function main() {
     socket.on('close', () => {
       if (client !== socket) return;
       client = null;
+      clientAddress = null;
       console.log('[Servidor] Cliente desconectado.');
       backToServer(0.5, 'cliente desconectou');
+      dashboard.broadcast();
     });
   });
 
   server.listen(PORT, () => {
-    console.log(`[Servidor] Escutando na porta TCP ${PORT}. Cliente fica à ${CLIENT_EDGE === 'right' ? 'DIREITA' : 'ESQUERDA'}.`);
-    console.log('[Servidor] ScrollLock: volta ao servidor | no servidor: encerra e libera o mouse.');
+    console.log(`[Servidor] Escutando na porta TCP ${PORT}. Cliente configurado em: ${clientEdge.toUpperCase()}.`);
+    console.log(`[Servidor] Abra http://localhost:${UI_PORT} para configurar as telas visualmente!`);
   });
 
   const shutdown = () => {
