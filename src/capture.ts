@@ -7,6 +7,9 @@ import { SCRIPTS_DIR, detectLinuxScreen, ensureLinuxDeviceAccess } from './platf
 export interface Capture extends EventEmitter {
   start(): Promise<{ width: number; height: number }>;
   setRemote(on: boolean, yRatio?: number): void;
+  clientEnter(yRatio: number): void;
+  clientLeave(): void;
+  injectFromClient(packet: InputPacket): void;
   setClipboard(text: string): void;
   updateConfig(cfg: Partial<CaptureOptions>): void;
   centerCursor(): void;
@@ -65,6 +68,9 @@ class LinuxCapture extends EventEmitter implements Capture {
           case 'edge':
             this.emit('edge', Number(msg.yRatio));
             break;
+          case 'client_return':
+            this.emit('client_return', Number(msg.yRatio));
+            break;
           case 'pos':
             this.emit('pos', { x: Number(msg.x), y: Number(msg.y) });
             break;
@@ -97,6 +103,28 @@ class LinuxCapture extends EventEmitter implements Capture {
 
   setRemote(on: boolean, yRatio?: number): void {
     this.proc?.stdin?.write(JSON.stringify({ cmd: 'remote', on, yRatio }) + '\n');
+  }
+
+  clientEnter(yRatio: number): void {
+    this.proc?.stdin?.write(JSON.stringify({ cmd: 'client_enter', yRatio }) + '\n');
+  }
+
+  clientLeave(): void {
+    this.proc?.stdin?.write(JSON.stringify({ cmd: 'client_leave' }) + '\n');
+  }
+
+  injectFromClient(packet: InputPacket): void {
+    if (packet.type === 'move') {
+      this.proc?.stdin?.write(JSON.stringify({ cmd: 'inject_move', dx: packet.dx, dy: packet.dy }) + '\n');
+    } else if (packet.type === 'button') {
+      this.proc?.stdin?.write(
+        JSON.stringify({ cmd: 'inject_button', button: packet.button, down: packet.down }) + '\n'
+      );
+    } else if (packet.type === 'wheel') {
+      this.proc?.stdin?.write(JSON.stringify({ cmd: 'inject_wheel', dy: packet.dy, dx: packet.dx }) + '\n');
+    } else if (packet.type === 'key') {
+      this.proc?.stdin?.write(JSON.stringify({ cmd: 'inject_key', code: packet.code, down: packet.down }) + '\n');
+    }
   }
 
   setClipboard(text: string): void {
@@ -232,6 +260,10 @@ class GenericCapture extends EventEmitter implements Capture {
   setClipboard(_text: string): void {
     // no-op on generic fallback
   }
+
+  clientEnter(_yRatio: number): void {}
+  clientLeave(): void {}
+  injectFromClient(_packet: InputPacket): void {}
 
   centerCursor(): void {
     void this.warp(Math.floor(this.width / 2), Math.floor(this.height / 2));

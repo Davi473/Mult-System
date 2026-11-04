@@ -1,6 +1,6 @@
 import net from 'net';
 import { Injector, createInjector } from './inject';
-import { Packet, LineReader, encode, loadEnv, parseEdge } from './protocol';
+import { InputPacket, Packet, LineReader, encode, loadEnv, parseEdge } from './protocol';
 
 loadEnv();
 
@@ -41,6 +41,18 @@ class KVMClient {
     injector.on('clipboard', (text: string) => {
       this.send({ type: 'clipboard', text });
       console.log('[Cliente] Área de transferência enviada para o Servidor Linux.');
+    });
+    injector.on('client_enter', (yRatio: number) => {
+      this.active = false;
+      console.log('[Cliente] Borda atingida -> Mouse/Teclado do Cliente agora controlando o Servidor Linux!');
+      this.send({ type: 'client_enter', yRatio });
+    });
+    injector.on('client_leave', () => {
+      console.log('[Cliente] ScrollLock -> Controle voltou para o Cliente.');
+      this.send({ type: 'client_leave' });
+    });
+    injector.on('client_input', (pkt: InputPacket) => {
+      this.send(pkt);
     });
     injector.on('exit', (code: number) => {
       console.error(`[Cliente] Injetor encerrou (código ${code}). Saindo.`);
@@ -117,7 +129,12 @@ class KVMClient {
         }
         this.active = true;
         this.injector.enter(packet.yRatio);
-        console.log('[Cliente] Controle recebido.');
+        console.log('[Cliente] Controle recebido do Servidor.');
+        break;
+      case 'client_return':
+        this.active = false;
+        this.injector.clientReturned(packet.yRatio);
+        console.log('[Cliente] Cursor retornou do Servidor Linux para o Cliente Windows.');
         break;
       case 'leave':
         if (this.active) {

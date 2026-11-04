@@ -50,6 +50,22 @@ export class Injector extends EventEmitter {
           } catch {
             // ignore
           }
+        } else if (line.startsWith('cs_e ')) {
+          this.emit('client_enter', Number(line.slice(5)));
+        } else if (line === 'cs_l') {
+          this.emit('client_leave');
+        } else if (line.startsWith('cs_m ')) {
+          const p = line.slice(5).trim().split(' ');
+          this.emit('client_input', { type: 'move', dx: Number(p[0]), dy: Number(p[1]) });
+        } else if (line.startsWith('cs_b ')) {
+          const p = line.slice(5).trim().split(' ');
+          this.emit('client_input', { type: 'button', button: Number(p[0]), down: p[1] === '1' });
+        } else if (line.startsWith('cs_w ')) {
+          const p = line.slice(5).trim().split(' ');
+          this.emit('client_input', { type: 'wheel', dy: Number(p[0]), dx: Number(p[1]) });
+        } else if (line.startsWith('cs_k ')) {
+          const p = line.slice(5).trim().split(' ');
+          this.emit('client_input', { type: 'key', code: Number(p[0]), down: p[1] === '1' });
         }
       });
 
@@ -79,6 +95,9 @@ export class Injector extends EventEmitter {
   }
   enter(yRatio: number) {
     this.write(`e ${Math.min(1, Math.max(0, yRatio)).toFixed(4)}`);
+  }
+  clientReturned(yRatio: number) {
+    this.write(`cr ${Math.min(1, Math.max(0, yRatio)).toFixed(4)}`);
   }
   leave() {
     this.write('l');

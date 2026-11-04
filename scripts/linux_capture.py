@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
-Captura de mouse/teclado e sincronização de Clipboard do SERVIDOR KVM no Linux (Wayland e X11).
+Captura e Injeção bidirecional de mouse/teclado + Clipboard do SERVIDOR KVM no Linux (Wayland e X11).
+Permite:
+  1. Usar o mouse/teclado físicos do Servidor Linux para controlar o Cliente Windows 11.
+  2. Receber o mouse/teclado físicos do Cliente Windows 11 para controlar o Servidor Linux via /dev/uinput.
 """
 import fcntl
 import json
@@ -27,8 +30,8 @@ REL_X, REL_Y, REL_HWHEEL, REL_WHEEL = 0x00, 0x01, 0x06, 0x08
 ABS_X, ABS_Y = 0x00, 0x01
 
 MOUSE_BUTTONS = {0x110: 1, 0x111: 2, 0x112: 3, 0x113: 4, 0x114: 5}
+BUTTON_TO_EVDEV = {v: k for k, v in MOUSE_BUTTONS.items()}
 KEY_SCROLLLOCK = 70
-# Teclas modificadoras (Ctrl, Shift, Alt, Win/Super) não devem enviar auto-repeat (v == 2)
 MODIFIER_KEYS = {29, 42, 54, 56, 97, 100, 125, 126}
 
 EVENT_FMT = "llHHi"
@@ -62,8 +65,6 @@ class LinuxClipboard:
         self.cb = None
         self.GLib = None
         try:
-            # No Wayland, processos em background precisam usar o backend X11 (XWayland)
-            # para conseguir ler/escrever o clipboard global sem precisar de janela em foco.
             os.environ["GDK_BACKEND"] = "x11"
             import gi
 
@@ -75,7 +76,6 @@ class LinuxClipboard:
             self.GLib = GLib
             self.cb = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
             self.available = True
-            # Monitora mudanças no clipboard do Linux a cada 400ms automaticamente
             GLib.timeout_add(400, self._poll)
             t = threading.Thread(target=Gtk.main, daemon=True)
             t.start()
@@ -155,7 +155,7 @@ def list_devices():
 
 
 class VirtualPointer:
-    """Ponteiro absoluto virtual via /dev/uinput para posicionar o cursor no retorno ao Servidor."""
+    """Ponteiro absoluto + botões + roda + teclado virtual via /dev/uinput no Servidor Linux."""
 
     def __init__(self, width, height):
         self.fd = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
@@ -179,18 +179,72 @@ class VirtualPointer:
         )
         fcntl.ioctl(self.fd, UI_DEV_CREATE)
 
-    def _write(self, *events):
-        os.write(self.fd, b"".join(events) + ev(EV_SYN, SYN_REPORT, 0))
+        # Teclado virtual separado para injetar teclas vindas do Cliente Windows 11
+        self.kbd_fd = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
+        fcntl.ioctl(self.kbd_fd, UI_SET_EVBIT, EV_SYN)
+        fcntl.ioctl(self.kbd_fd, UI_SET_EVBIT, EV_KEY)
+        for k in range(1, 249):
+            fcntl.ioctl(self.kbd_fd, UI_SET_KEYBIT, k)
+        kbd_name = (VIRTUAL_PREFIX + " Keyboard").encode()
+        os.write(
+            self.kbd_fd,
+            struct.pack("80sHHHHI64i64i64i64i", kbd_name, 0x03, 0x1234, 0x567A, 1, 0, *zeros, *zeros, *zeros, *zeros),
+        )
+        fcntl.ioctl(self.kbd_fd, UI_DEV_CREATE)
+
+        self.pressed_buttons = set()
+        self.pressed_keys = set()
+
+    def _write(self, fd, *events):
+        os.write(fd, b"".join(events) + ev(EV_SYN, SYN_REPORT, 0))
 
     def move(self, x, y):
-        self._write(ev(EV_ABS, ABS_X, x), ev(EV_ABS, ABS_Y, y))
+        self._write(self.fd, ev(EV_ABS, ABS_X, x), ev(EV_ABS, ABS_Y, y))
+
+    def button(self, button_num, down):
+        code = BUTTON_TO_EVDEV.get(int(button_num))
+        if not code:
+            return
+        self._write(self.fd, ev(EV_KEY, code, 1 if down else 0))
+        if down:
+            self.pressed_buttons.add(code)
+        else:
+            self.pressed_buttons.discard(code)
+
+    def wheel(self, dy, dx):
+        if dy:
+            self._write(self.fd, ev(EV_REL, REL_WHEEL, dy))
+        if dx:
+            self._write(self.fd, ev(EV_REL, REL_HWHEEL, dx))
+
+    def key(self, code, down):
+        c = int(code)
+        if 1 <= c <= 248:
+            self._write(self.kbd_fd, ev(EV_KEY, c, 1 if down else 0))
+            if down:
+                self.pressed_keys.add(c)
+            else:
+                self.pressed_keys.discard(c)
+
+    def release_all(self):
+        for code in list(self.pressed_buttons):
+            self._write(self.fd, ev(EV_KEY, code, 0))
+        for code in list(self.pressed_keys):
+            self._write(self.kbd_fd, ev(EV_KEY, code, 0))
+        self.pressed_buttons.clear()
+        self.pressed_keys.clear()
 
     def close(self):
-        try:
-            fcntl.ioctl(self.fd, UI_DEV_DESTROY)
-        except OSError:
-            pass
-        os.close(self.fd)
+        self.release_all()
+        for f in (self.fd, self.kbd_fd):
+            try:
+                fcntl.ioctl(f, UI_DEV_DESTROY)
+            except OSError:
+                pass
+            try:
+                os.close(f)
+            except OSError:
+                pass
 
 
 class Capture:
@@ -201,7 +255,8 @@ class Capture:
         self.speed = float(cfg.get("speed", 1.0))
         self.accel = float(cfg.get("accel", 1.0))
 
-        self.remote = False
+        self.remote = False  # True quando Servidor controla Cliente
+        self.client_controlling = False  # True quando Cliente controla Servidor
         self.edge_notified = False
         self.x = self.width // 2
         self.y = self.height // 2
@@ -325,6 +380,21 @@ class Capture:
             cmd = msg.get("cmd")
             if cmd == "remote":
                 self.set_remote(bool(msg.get("on")), msg.get("yRatio"))
+            elif cmd == "client_enter":
+                self.on_client_enter(msg.get("yRatio", 0.5))
+            elif cmd == "client_leave":
+                self.on_client_leave()
+            elif cmd == "inject_move":
+                self.on_inject_move(int(msg.get("dx", 0)), int(msg.get("dy", 0)))
+            elif cmd == "inject_button":
+                if self.client_controlling and self.pointer:
+                    self.pointer.button(int(msg.get("button", 1)), bool(msg.get("down")))
+            elif cmd == "inject_wheel":
+                if self.client_controlling and self.pointer:
+                    self.pointer.wheel(int(msg.get("dy", 0)), int(msg.get("dx", 0)))
+            elif cmd == "inject_key":
+                if self.client_controlling and self.pointer:
+                    self.pointer.key(int(msg.get("code", 0)), bool(msg.get("down")))
             elif cmd == "clipboard":
                 self.clipboard.write(msg.get("text", ""))
             elif cmd == "config":
@@ -342,6 +412,73 @@ class Capture:
                     self.pointer.move(self.x, self.y)
                 send({"type": "pos", "x": self.x, "y": self.y})
         return True
+
+    def on_client_enter(self, ratio):
+        self.client_controlling = True
+        self.cooldown_until = time.monotonic() + 0.30
+        r = min(max(float(ratio if ratio is not None else 0.5), 0.0), 1.0)
+        offset = 40
+        if self.edge == "right":
+            self.x = max(0, self.width - offset)
+            self.y = int(r * (self.height - 1))
+        elif self.edge == "left":
+            self.x = min(self.width - 1, offset)
+            self.y = int(r * (self.height - 1))
+        elif self.edge == "top":
+            self.x = int(r * (self.width - 1))
+            self.y = min(self.height - 1, offset)
+        else:
+            self.x = int(r * (self.width - 1))
+            self.y = max(0, self.height - offset)
+
+        if self.pointer:
+            self.pointer.move(self.x, self.y)
+        send({"type": "pos", "x": self.x, "y": self.y})
+
+    def on_client_leave(self):
+        self.client_controlling = False
+        if self.pointer:
+            self.pointer.release_all()
+
+    def on_inject_move(self, dx, dy):
+        if not self.client_controlling:
+            return
+        nx = self.x + dx
+        ny = self.y + dy
+        now = time.monotonic()
+
+        if now >= self.cooldown_until:
+            hit = False
+            ratio = 0.5
+            if self.edge == "right" and nx >= self.width - 1 and dx > 0:
+                hit = True
+                ratio = min(max(ny, 0), self.height - 1) / float(max(1, self.height - 1))
+            elif self.edge == "left" and nx <= 0 and dx < 0:
+                hit = True
+                ratio = min(max(ny, 0), self.height - 1) / float(max(1, self.height - 1))
+            elif self.edge == "top" and ny <= 0 and dy < 0:
+                hit = True
+                ratio = min(max(nx, 0), self.width - 1) / float(max(1, self.width - 1))
+            elif self.edge == "bottom" and ny >= self.height - 1 and dy > 0:
+                hit = True
+                ratio = min(max(nx, 0), self.width - 1) / float(max(1, self.width - 1))
+
+            if hit:
+                self.client_controlling = False
+                if self.pointer:
+                    self.pointer.release_all()
+                self.cooldown_until = now + 0.30
+                send({"type": "client_return", "yRatio": round(ratio, 4)})
+                return
+
+        self.x = min(max(nx, 0), self.width - 1)
+        self.y = min(max(ny, 0), self.height - 1)
+        if self.pointer:
+            self.pointer.move(self.x, self.y)
+
+        if now - self.last_pos_sent >= 0.033:
+            self.last_pos_sent = now
+            send({"type": "pos", "x": self.x, "y": self.y})
 
     def read_mouse(self, fd):
         for t, c, v in self.read_events(fd, self.mouse_fds):
@@ -373,7 +510,6 @@ class Capture:
                 continue
             if not self.remote:
                 continue
-            # Ignora auto-repeat (v == 2) em teclas modificadoras (Ctrl, Shift, Alt, Win)
             if c in MODIFIER_KEYS and v == 2:
                 continue
             if v in (0, 1, 2):
@@ -382,6 +518,8 @@ class Capture:
     def on_motion(self, dx, dy):
         if self.remote:
             send({"type": "move", "dx": dx, "dy": dy})
+            return
+        if self.client_controlling:
             return
 
         speed = math.hypot(dx, dy)
@@ -448,12 +586,15 @@ class Capture:
         if self.remote:
             self.set_remote(False, None)
             send({"type": "emergency"})
+        elif self.client_controlling:
+            self.on_client_leave()
+            send({"type": "client_return", "yRatio": 0.5})
 
     def set_remote(self, on, ratio):
         if on == self.remote:
             return
         if on:
-            # Ao entrar no Cliente, lê o clipboard atual do Linux e envia para o Windows 11
+            self.client_controlling = False
             self.clipboard.read_and_send()
             for fd in list(self.mouse_fds) + list(self.kbd_fds):
                 try:

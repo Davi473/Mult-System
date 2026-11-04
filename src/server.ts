@@ -16,7 +16,8 @@ async function main() {
   const capture = createCapture({ edge: clientEdge, speed: mouseSpeed, accel: mouseAccel });
   let client: net.Socket | null = null;
   let clientAddress: string | null = null;
-  let remote = false;
+  let remote = false; // True quando mouse/teclado do Servidor controla o Cliente
+  let clientControlling = false; // True quando mouse/teclado do Cliente controla o Servidor
 
   let serverScreen = { width: 1920, height: 1080 };
   let clientScreen = { width: 1920, height: 1080 };
@@ -97,12 +98,20 @@ async function main() {
   };
 
   capture.on('edge', (yRatio: number) => {
-    if (!client || remote) return;
+    if (!client || remote || clientControlling) return;
     remote = true;
     capture.setRemote(true);
     const returnEdge = oppositeEdge(clientEdge);
     send({ type: 'enter', yRatio, returnEdge });
-    console.log(`[Servidor] Borda (${clientEdge}) atingida -> controle transferido para o Cliente.`);
+    console.log(`[Servidor] Borda (${clientEdge}) atingida -> Mouse do Servidor controlando o Cliente.`);
+    dashboard.broadcast();
+  });
+
+  capture.on('client_return', (yRatio: number) => {
+    if (!clientControlling) return;
+    clientControlling = false;
+    send({ type: 'client_return', yRatio });
+    console.log('[Servidor] Borda atingida -> Mouse do Cliente devolvido para o Cliente.');
     dashboard.broadcast();
   });
 
@@ -166,6 +175,31 @@ async function main() {
       }
       if (packet.type === 'return' || packet.type === 'return_server') {
         backToServer(Number(packet.yRatio ?? 0.5), 'borda do cliente');
+      } else if (packet.type === 'client_enter') {
+        if (remote) {
+          remote = false;
+          capture.setRemote(false, 0.5);
+        }
+        clientControlling = true;
+        capture.clientEnter(Number(packet.yRatio ?? 0.5));
+        console.log('[Servidor] Mouse/Teclado do Cliente Windows assumiu controle do Servidor Linux!');
+        dashboard.broadcast();
+      } else if (packet.type === 'client_leave') {
+        if (clientControlling) {
+          clientControlling = false;
+          capture.clientLeave();
+          console.log('[Servidor] Cliente Windows devolveu controle local (ScrollLock).');
+          dashboard.broadcast();
+        }
+      } else if (
+        packet.type === 'move' ||
+        packet.type === 'button' ||
+        packet.type === 'wheel' ||
+        packet.type === 'key'
+      ) {
+        if (clientControlling) {
+          capture.injectFromClient(packet);
+        }
       } else if (packet.type === 'clipboard') {
         if (packet.text) {
           capture.setClipboard(String(packet.text));
@@ -188,6 +222,10 @@ async function main() {
       if (client !== socket) return;
       client = null;
       clientAddress = null;
+      if (clientControlling) {
+        clientControlling = false;
+        capture.clientLeave();
+      }
       console.log('[Servidor] Cliente desconectado.');
       backToServer(0.5, 'cliente desconectou');
       dashboard.broadcast();

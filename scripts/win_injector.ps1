@@ -1,21 +1,28 @@
 <#
-  Injetor de mouse/teclado e sincronização de Clipboard do CLIENTE KVM no Windows 11/10.
+  Injetor e Capturador Bidirecional de mouse/teclado + Clipboard do CLIENTE KVM no Windows 11/10.
 
-  Comandos via stdin:
-    e <ratio>         -> controle entrou: posiciona o cursor a 40px da borda de entrada
-    c <edge>          -> atualiza a borda de retorno (left, right, top, bottom)
+  Comandos via stdin (Servidor -> Cliente):
+    e <ratio>         -> Servidor assumiu controle do Cliente: posiciona cursor a 40px da borda
+    cr <ratio>        -> Cliente estava controlando o Servidor e o cursor voltou para o Cliente
+    c <edge>          -> atualiza a borda de transição/retorno (left, right, top, bottom)
     cb <base64>       -> atualiza o Clipboard do Windows com o texto copiado no Linux
-    m <dx> <dy>       -> movimento relativo
-    b <botao> <0|1>   -> botão (1=esq, 2=dir, 3=meio, 4=voltar, 5=avançar)
-    w <dy> <dx>       -> rolagem
-    k <codigo> <0|1>  -> tecla (código evdev do Linux -> VirtualKey + Scancode Win32)
+    m <dx> <dy>       -> movimento relativo injetado no Windows
+    b <botao> <0|1>   -> botão injetado no Windows
+    w <dy> <dx>       -> rolagem injetada no Windows
+    k <codigo> <0|1>  -> tecla injetada no Windows
     l                 -> controle saiu: solta todas as teclas/botões
 
-  Saída via stdout:
+  Saída via stdout (Cliente -> Servidor):
     ready <largura>x<altura>
-    r <ratio>         -> cursor atingiu a borda de retorno (devolver ao servidor)
-    p <x> <y>         -> posição atual do cursor no cliente (para o Frontend visual)
+    r <ratio>         -> cursor do Servidor atingiu a borda de retorno no Cliente
+    p <x> <y>         -> posição atual do cursor no Cliente
     cb <base64>       -> texto copiado no Windows (para atualizar o Clipboard do Linux)
+    cs_e <ratio>      -> mouse físico do Cliente atingiu a borda para controlar o Servidor Linux!
+    cs_l              -> ScrollLock pressionado no Cliente (encerra controle do Servidor)
+    cs_m <dx> <dy>    -> movimento do mouse físico do Cliente enviado ao Servidor
+    cs_b <btn> <0|1>  -> botão do mouse físico do Cliente enviado ao Servidor
+    cs_w <dy> <dx>    -> rolagem do mouse físico do Cliente enviada ao Servidor
+    cs_k <code> <0|1> -> tecla física do Cliente (em código evdev) enviada ao Servidor
 #>
 param([string]$ReturnEdge = 'left')
 
@@ -24,6 +31,7 @@ $ErrorActionPreference = 'Stop'
 $source = @'
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Runtime.InteropServices;
@@ -32,6 +40,18 @@ using System.Threading;
 
 public static class KvmInjector
 {
+    [StructLayout(LayoutKind.Sequential)]
+    private struct POINT { public int X; public int Y; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MSG { public IntPtr hwnd; public uint message; public IntPtr wParam; public IntPtr lParam; public uint time; public POINT pt; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MSLLHOOKSTRUCT { public POINT pt; public uint mouseData; public uint flags; public uint time; public IntPtr dwExtraInfo; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct KBDLLHOOKSTRUCT { public uint vkCode; public uint scanCode; public uint flags; public uint time; public IntPtr dwExtraInfo; }
+
     [StructLayout(LayoutKind.Sequential)]
     private struct MOUSEINPUT { public int dx; public int dy; public uint mouseData; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
 
@@ -44,11 +64,22 @@ public static class KvmInjector
     [StructLayout(LayoutKind.Sequential)]
     private struct INPUT { public uint type; public INPUTUNION u; }
 
+    private delegate IntPtr LowLevelProc(int nCode, IntPtr wParam, IntPtr lParam);
+
     [DllImport("user32.dll", SetLastError = true)] private static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
     [DllImport("user32.dll")] private static extern bool SetCursorPos(int x, int y);
+    [DllImport("user32.dll")] private static extern bool GetCursorPos(out POINT lpPoint);
     [DllImport("user32.dll")] private static extern int GetSystemMetrics(int nIndex);
     [DllImport("user32.dll")] private static extern bool SetProcessDPIAware();
     [DllImport("user32.dll")] private static extern uint MapVirtualKey(uint uCode, uint uMapType);
+
+    [DllImport("user32.dll", SetLastError = true)] private static extern IntPtr SetWindowsHookEx(int idHook, LowLevelProc lpfn, IntPtr hMod, uint dwThreadId);
+    [DllImport("user32.dll")] private static extern bool UnhookWindowsHookEx(IntPtr hhk);
+    [DllImport("user32.dll")] private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+    [DllImport("user32.dll")] private static extern int GetMessage(out MSG lpMsg, IntPtr hWnd, uint wMsgFilterMin, uint wMsgFilterMax);
+    [DllImport("user32.dll")] private static extern bool TranslateMessage(ref MSG lpMsg);
+    [DllImport("user32.dll")] private static extern IntPtr DispatchMessage(ref MSG lpMsg);
+    [DllImport("kernel32.dll", CharSet = CharSet.Auto)] private static extern IntPtr GetModuleHandle(string lpModuleName);
 
     [DllImport("user32.dll")] private static extern bool OpenClipboard(IntPtr hWndNewOwner);
     [DllImport("user32.dll")] private static extern bool CloseClipboard();
@@ -65,6 +96,8 @@ public static class KvmInjector
     [DllImport("kernel32.dll")] private static extern IntPtr GlobalLock(IntPtr hMem);
     [DllImport("kernel32.dll")] private static extern bool GlobalUnlock(IntPtr hMem);
 
+    private const int WH_KEYBOARD_LL = 13;
+    private const int WH_MOUSE_LL = 14;
     private const uint INPUT_MOUSE = 0;
     private const uint INPUT_KEYBOARD = 1;
     private const uint MOUSEEVENTF_MOVE = 0x0001;
@@ -81,24 +114,24 @@ public static class KvmInjector
     // evdev -> (scancode, virtualKey) para teclas estendidas (E0)
     private static readonly Dictionary<int, int[]> ExtendedKeys = new Dictionary<int, int[]>
     {
-        { 96,  new int[] { 0x1C, 0x0D } }, // KP Enter
-        { 97,  new int[] { 0x1D, 0xA3 } }, // Right Ctrl (VK_RCONTROL)
-        { 98,  new int[] { 0x35, 0x6F } }, // KP /
-        { 99,  new int[] { 0x37, 0x2C } }, // PrintScreen
-        { 100, new int[] { 0x38, 0xA5 } }, // Right Alt / AltGr (VK_RMENU)
-        { 102, new int[] { 0x47, 0x24 } }, // Home
-        { 103, new int[] { 0x48, 0x26 } }, // Up
-        { 104, new int[] { 0x49, 0x21 } }, // PageUp
-        { 105, new int[] { 0x4B, 0x25 } }, // Left
-        { 106, new int[] { 0x4D, 0x27 } }, // Right
-        { 107, new int[] { 0x4F, 0x23 } }, // End
-        { 108, new int[] { 0x50, 0x28 } }, // Down
-        { 109, new int[] { 0x51, 0x22 } }, // PageDown
-        { 110, new int[] { 0x52, 0x2D } }, // Insert
-        { 111, new int[] { 0x53, 0x2E } }, // Delete
-        { 125, new int[] { 0x5B, 0x5B } }, // Left Win (VK_LWIN)
-        { 126, new int[] { 0x5C, 0x5C } }, // Right Win (VK_RWIN)
-        { 127, new int[] { 0x5D, 0x5D } }, // Menu (VK_APPS)
+        { 96,  new int[] { 0x1C, 0x0D } },
+        { 97,  new int[] { 0x1D, 0xA3 } },
+        { 98,  new int[] { 0x35, 0x6F } },
+        { 99,  new int[] { 0x37, 0x2C } },
+        { 100, new int[] { 0x38, 0xA5 } },
+        { 102, new int[] { 0x47, 0x24 } },
+        { 103, new int[] { 0x48, 0x26 } },
+        { 104, new int[] { 0x49, 0x21 } },
+        { 105, new int[] { 0x4B, 0x25 } },
+        { 106, new int[] { 0x4D, 0x27 } },
+        { 107, new int[] { 0x4F, 0x23 } },
+        { 108, new int[] { 0x50, 0x28 } },
+        { 109, new int[] { 0x51, 0x22 } },
+        { 110, new int[] { 0x52, 0x2D } },
+        { 111, new int[] { 0x53, 0x2E } },
+        { 125, new int[] { 0x5B, 0x5B } },
+        { 126, new int[] { 0x5C, 0x5C } },
+        { 127, new int[] { 0x5D, 0x5D } },
     };
 
     private static readonly Dictionary<int, int> MediaVirtualKeys = new Dictionary<int, int>
@@ -110,11 +143,16 @@ public static class KvmInjector
     private static readonly HashSet<int> PressedKeys = new HashSet<int>();
     private static readonly HashSet<int> PressedButtons = new HashSet<int>();
     private static readonly int InputSize = Marshal.SizeOf(typeof(INPUT));
+    private static readonly object outLock = new object();
     private static StreamWriter output;
-    private static bool active;
+
+    private static volatile bool active;           // True quando Servidor Linux controla este Windows
+    private static volatile bool capturingServer;  // True quando mouse/teclado físico deste Windows controla o Linux
     private static string returnEdge = "left";
     private static int vx, vy, vw, vh;
     private static int curX, curY;
+    private static int lastPhysX, lastPhysY;
+    private static bool hasLastPhys;
     private static long cooldownUntilTick;
     private static long lastPosTick;
     private static string lastClipboard = "";
@@ -122,6 +160,22 @@ public static class KvmInjector
     private static IntPtr clipHwnd = IntPtr.Zero;
     private static readonly object clipLock = new object();
     private static Timer clipTimer;
+
+    private static IntPtr mouseHook = IntPtr.Zero;
+    private static IntPtr kbdHook = IntPtr.Zero;
+    private static readonly LowLevelProc mouseProcDelegate = MouseHookCallback;
+    private static readonly LowLevelProc kbdProcDelegate = KeyboardHookCallback;
+
+    private static void WriteOut(string line)
+    {
+        lock (outLock)
+        {
+            if (output != null)
+            {
+                output.WriteLine(line);
+            }
+        }
+    }
 
     private static void Send(INPUT input)
     {
@@ -132,7 +186,6 @@ public static class KvmInjector
     {
         if (clipHwnd == IntPtr.Zero)
         {
-            // HWND_MESSAGE = -3 (necessário no Win32 para que EmptyClipboard + SetClipboardData funcione)
             clipHwnd = CreateWindowExW(0, "Static", "MultSystemKVMClip", 0, 0, 0, 0, 0, new IntPtr(-3), IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
         }
         return clipHwnd;
@@ -207,11 +260,210 @@ public static class KvmInjector
                 {
                     lastClipboard = txt;
                     string b64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(txt));
-                    output.WriteLine("cb " + b64);
+                    WriteOut("cb " + b64);
                 }
             }
             catch { }
         }
+    }
+
+    private static int ScanToEvdev(int scan, bool ext, int vk)
+    {
+        if (ext)
+        {
+            switch (scan)
+            {
+                case 0x1C: return 96;
+                case 0x1D: return 97;
+                case 0x35: return 98;
+                case 0x37: return 99;
+                case 0x38: return 100;
+                case 0x47: return 102;
+                case 0x48: return 103;
+                case 0x49: return 104;
+                case 0x4B: return 105;
+                case 0x4D: return 106;
+                case 0x4F: return 107;
+                case 0x50: return 108;
+                case 0x51: return 109;
+                case 0x52: return 110;
+                case 0x53: return 111;
+                case 0x5B: return 125;
+                case 0x5C: return 126;
+                case 0x5D: return 127;
+            }
+        }
+        if (scan >= 1 && scan <= 88) return scan;
+        if (scan == 0x73) return 89;
+        if (scan == 0x7E) return 121;
+        if (vk == 0xA2) return 29;
+        if (vk == 0xA3) return 97;
+        if (vk == 0xA0) return 42;
+        if (vk == 0xA1) return 54;
+        if (vk == 0xA4) return 56;
+        if (vk == 0xA5) return 100;
+        return 0;
+    }
+
+    private static IntPtr MouseHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
+    {
+        if (nCode >= 0)
+        {
+            MSLLHOOKSTRUCT ms = (MSLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(MSLLHOOKSTRUCT));
+            // Ignora eventos injetados pelo próprio SendInput ou quando o Servidor Linux está no controle
+            if ((ms.flags & 0x03) == 0 && !active)
+            {
+                int msg = wParam.ToInt32();
+                if (!capturingServer)
+                {
+                    if (msg == 0x0200) // WM_MOUSEMOVE local no Windows
+                    {
+                        int dx = hasLastPhys ? (ms.pt.X - lastPhysX) : 0;
+                        int dy = hasLastPhys ? (ms.pt.Y - lastPhysY) : 0;
+                        lastPhysX = ms.pt.X;
+                        lastPhysY = ms.pt.Y;
+                        hasLastPhys = true;
+
+                        if (Environment.TickCount - cooldownUntilTick >= 0)
+                        {
+                            RefreshBounds();
+                            bool hit = false;
+                            double ratio = 0.5;
+                            if (returnEdge == "left" && ms.pt.X <= vx + 1 && dx < 0)
+                            {
+                                hit = true;
+                                ratio = vh > 1 ? (double)(Math.Max(vy, Math.Min(vy + vh - 1, ms.pt.Y)) - vy) / (vh - 1) : 0.5;
+                            }
+                            else if (returnEdge == "right" && ms.pt.X >= vx + vw - 2 && dx > 0)
+                            {
+                                hit = true;
+                                ratio = vh > 1 ? (double)(Math.Max(vy, Math.Min(vy + vh - 1, ms.pt.Y)) - vy) / (vh - 1) : 0.5;
+                            }
+                            else if (returnEdge == "top" && ms.pt.Y <= vy + 1 && dy < 0)
+                            {
+                                hit = true;
+                                ratio = vw > 1 ? (double)(Math.Max(vx, Math.Min(vx + vw - 1, ms.pt.X)) - vx) / (vw - 1) : 0.5;
+                            }
+                            else if (returnEdge == "bottom" && ms.pt.Y >= vy + vh - 2 && dy > 0)
+                            {
+                                hit = true;
+                                ratio = vw > 1 ? (double)(Math.Max(vx, Math.Min(vx + vw - 1, ms.pt.X)) - vx) / (vw - 1) : 0.5;
+                            }
+
+                            if (hit)
+                            {
+                                capturingServer = true;
+                                cooldownUntilTick = Environment.TickCount + 300;
+                                CheckAndSendClipboard();
+                                WriteOut("cs_e " + ratio.ToString("0.0000", CultureInfo.InvariantCulture));
+                                return (IntPtr)1;
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    // Modo Cliente -> Servidor ativo: intercepta o mouse físico do Windows e envia ao Linux
+                    if (msg == 0x0200) // WM_MOUSEMOVE
+                    {
+                        POINT cur;
+                        GetCursorPos(out cur);
+                        int dx = ms.pt.X - cur.X;
+                        int dy = ms.pt.Y - cur.Y;
+                        if (dx != 0 || dy != 0)
+                        {
+                            WriteOut("cs_m " + dx + " " + dy);
+                        }
+                        return (IntPtr)1;
+                    }
+                    else if (msg == 0x0201) { WriteOut("cs_b 1 1"); return (IntPtr)1; }
+                    else if (msg == 0x0202) { WriteOut("cs_b 1 0"); return (IntPtr)1; }
+                    else if (msg == 0x0204) { WriteOut("cs_b 2 1"); return (IntPtr)1; }
+                    else if (msg == 0x0205) { WriteOut("cs_b 2 0"); return (IntPtr)1; }
+                    else if (msg == 0x0207) { WriteOut("cs_b 3 1"); return (IntPtr)1; }
+                    else if (msg == 0x0208) { WriteOut("cs_b 3 0"); return (IntPtr)1; }
+                    else if (msg == 0x020B)
+                    {
+                        int xb = ((ms.mouseData >> 16) & 0xFFFF) == 1 ? 4 : 5;
+                        WriteOut("cs_b " + xb + " 1");
+                        return (IntPtr)1;
+                    }
+                    else if (msg == 0x020C)
+                    {
+                        int xb = ((ms.mouseData >> 16) & 0xFFFF) == 1 ? 4 : 5;
+                        WriteOut("cs_b " + xb + " 0");
+                        return (IntPtr)1;
+                    }
+                    else if (msg == 0x020A) // WM_MOUSEWHEEL
+                    {
+                        short delta = (short)((ms.mouseData >> 16) & 0xFFFF);
+                        int steps = delta / 120;
+                        if (steps == 0) steps = Math.Sign(delta);
+                        if (steps != 0) WriteOut("cs_w " + steps + " 0");
+                        return (IntPtr)1;
+                    }
+                    else if (msg == 0x020E) // WM_MOUSEHWHEEL
+                    {
+                        short delta = (short)((ms.mouseData >> 16) & 0xFFFF);
+                        int steps = delta / 120;
+                        if (steps == 0) steps = Math.Sign(delta);
+                        if (steps != 0) WriteOut("cs_w 0 " + steps);
+                        return (IntPtr)1;
+                    }
+                }
+            }
+        }
+        return CallNextHookEx(mouseHook, nCode, wParam, lParam);
+    }
+
+    private static IntPtr KeyboardHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
+    {
+        if (nCode >= 0 && capturingServer && !active)
+        {
+            KBDLLHOOKSTRUCT kb = (KBDLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(KBDLLHOOKSTRUCT));
+            if ((kb.flags & 0x12) == 0)
+            {
+                int msg = wParam.ToInt32();
+                bool down = (msg == 0x0100 || msg == 0x0104);
+                if (kb.vkCode == 0x91) // ScrollLock libera o controle imediatamente
+                {
+                    if (down)
+                    {
+                        capturingServer = false;
+                        cooldownUntilTick = Environment.TickCount + 300;
+                        WriteOut("cs_l");
+                    }
+                    return (IntPtr)1;
+                }
+
+                bool ext = (kb.flags & 0x01) != 0;
+                int evCode = ScanToEvdev((int)kb.scanCode, ext, (int)kb.vkCode);
+                if (evCode > 0)
+                {
+                    WriteOut("cs_k " + evCode + " " + (down ? "1" : "0"));
+                }
+                return (IntPtr)1;
+            }
+        }
+        return CallNextHookEx(kbdHook, nCode, wParam, lParam);
+    }
+
+    private static void StartHooksThread()
+    {
+        Thread t = new Thread(() =>
+        {
+            IntPtr hMod = GetModuleHandle(null);
+            mouseHook = SetWindowsHookEx(WH_MOUSE_LL, mouseProcDelegate, hMod, 0);
+            kbdHook = SetWindowsHookEx(WH_KEYBOARD_LL, kbdProcDelegate, hMod, 0);
+            MSG msg;
+            while (GetMessage(out msg, IntPtr.Zero, 0, 0) > 0)
+            {
+                TranslateMessage(ref msg);
+                DispatchMessage(ref msg);
+            }
+        });
+        t.IsBackground = true;
+        t.Start();
     }
 
     private static void Mouse(int dx, int dy, uint data, uint flags)
@@ -243,7 +495,7 @@ public static class KvmInjector
         if (vh <= 0) vh = GetSystemMetrics(1);
     }
 
-    private static void Enter(double ratio)
+    private static void PlaceAtReturnEdge(double ratio)
     {
         RefreshBounds();
         double r = Math.Max(0.0, Math.Min(1.0, ratio));
@@ -272,10 +524,25 @@ public static class KvmInjector
 
         curX = Math.Max(vx, Math.Min(vx + vw - 1, curX));
         curY = Math.Max(vy, Math.Min(vy + vh - 1, curY));
+        lastPhysX = curX;
+        lastPhysY = curY;
         cooldownUntilTick = Environment.TickCount + 300;
-        active = true;
         MoveCursorAbsolute(curX, curY);
-        output.WriteLine("p " + (curX - vx) + " " + (curY - vy));
+        WriteOut("p " + (curX - vx) + " " + (curY - vy));
+    }
+
+    private static void Enter(double ratio)
+    {
+        capturingServer = false;
+        active = true;
+        PlaceAtReturnEdge(ratio);
+    }
+
+    private static void ClientReturned(double ratio)
+    {
+        capturingServer = false;
+        active = false;
+        PlaceAtReturnEdge(ratio);
     }
 
     private static void Move(int dx, int dy)
@@ -314,9 +581,10 @@ public static class KvmInjector
             if (hit)
             {
                 active = false;
+                cooldownUntilTick = Environment.TickCount + 300;
                 ReleaseAll();
                 CheckAndSendClipboard();
-                output.WriteLine("r " + ratio.ToString("0.0000", CultureInfo.InvariantCulture));
+                WriteOut("r " + ratio.ToString("0.0000", CultureInfo.InvariantCulture));
                 return;
             }
         }
@@ -328,7 +596,7 @@ public static class KvmInjector
         if (now - lastPosTick >= 33)
         {
             lastPosTick = now;
-            output.WriteLine("p " + (curX - vx) + " " + (curY - vy));
+            WriteOut("p " + (curX - vx) + " " + (curY - vy));
         }
     }
 
@@ -379,14 +647,14 @@ public static class KvmInjector
         else
         {
             if (code >= 1 && code <= 88) scan = code;
-            else if (code == 89) scan = 0x73;  // ABNT2: / ?
-            else if (code == 121) scan = 0x7E; // ABNT2: . do numpad
+            else if (code == 89) scan = 0x73;
+            else if (code == 121) scan = 0x7E;
             else return;
 
-            if (code == 29) vk = 0xA2;      // Left Ctrl (VK_LCONTROL)
-            else if (code == 42) vk = 0xA0; // Left Shift (VK_LSHIFT)
-            else if (code == 54) vk = 0xA1; // Right Shift (VK_RSHIFT)
-            else if (code == 56) vk = 0xA4; // Left Alt (VK_LMENU)
+            if (code == 29) vk = 0xA2;
+            else if (code == 42) vk = 0xA0;
+            else if (code == 54) vk = 0xA1;
+            else if (code == 56) vk = 0xA4;
             else vk = (int)MapVirtualKey((uint)scan, 1);
 
             if (vk != 0)
@@ -405,7 +673,6 @@ public static class KvmInjector
         Send(i);
         if (down) PressedKeys.Add(code); else PressedKeys.Remove(code);
 
-        // Se acabou de soltar C (46) ou X (45) com Ctrl (29 ou 97) pressionado, sincroniza o clipboard!
         if (!down && (code == 46 || code == 45) && (PressedKeys.Contains(29) || PressedKeys.Contains(97)))
         {
             ThreadPool.QueueUserWorkItem(_ =>
@@ -434,6 +701,7 @@ public static class KvmInjector
         switch (cmd)
         {
             case "e": Enter(D(arg)); break;
+            case "cr": ClientReturned(D(arg)); break;
             case "c": returnEdge = arg.Trim().ToLowerInvariant(); break;
             case "cb":
                 try
@@ -468,7 +736,7 @@ public static class KvmInjector
                     Key(I(kp[0]), kp[1] == "1");
                 }
                 break;
-            case "l": active = false; ReleaseAll(); CheckAndSendClipboard(); break;
+            case "l": active = false; capturingServer = false; ReleaseAll(); CheckAndSendClipboard(); break;
         }
     }
 
@@ -482,10 +750,11 @@ public static class KvmInjector
 
         output = new StreamWriter(Console.OpenStandardOutput(), new UTF8Encoding(false));
         output.AutoFlush = true;
-        output.WriteLine("ready " + vw + "x" + vh);
+        WriteOut("ready " + vw + "x" + vh);
 
         lastClipSeq = GetClipboardSequenceNumber();
         clipTimer = new Timer(_ => CheckAndSendClipboard(), null, 400, 400);
+        StartHooksThread();
 
         StreamReader input = new StreamReader(Console.OpenStandardInput(), Encoding.ASCII);
         string line;
