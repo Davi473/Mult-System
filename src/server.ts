@@ -98,7 +98,8 @@ async function main() {
   };
 
   capture.on('edge', (yRatio: number) => {
-    if (!client || remote || clientControlling) return;
+    if (!client || remote) return;
+    clientControlling = false;
     remote = true;
     capture.setRemote(true);
     const returnEdge = oppositeEdge(clientEdge);

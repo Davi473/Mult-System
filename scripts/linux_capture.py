@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
 Captura e Injeção bidirecional de mouse/teclado + Clipboard do SERVIDOR KVM no Linux (Wayland e X11).
-Permite:
-  1. Usar o mouse/teclado físicos do Servidor Linux para controlar o Cliente Windows 11.
-  2. Receber o mouse/teclado físicos do Cliente Windows 11 para controlar o Servidor Linux via /dev/uinput.
+- O mouse e teclado físicos do Servidor Linux funcionam sempre localmente no Linux e, ao cruzar a borda,
+  assumem o controle do Cliente Windows 11.
+- O mouse e teclado físicos do Cliente Windows 11, ao cruzar a borda para o Linux, movem o cursor e
+  digitam no Linux via /dev/uinput (EV_REL + EV_KEY), sem bloquear o mouse/teclado físicos do Servidor!
 """
 import fcntl
 import json
@@ -20,14 +21,12 @@ EVIOCGRAB = 0x40044590
 UI_SET_EVBIT = 0x40045564
 UI_SET_KEYBIT = 0x40045565
 UI_SET_RELBIT = 0x40045566
-UI_SET_ABSBIT = 0x40045567
 UI_DEV_CREATE = 0x5501
 UI_DEV_DESTROY = 0x5502
 
-EV_SYN, EV_KEY, EV_REL, EV_ABS = 0x00, 0x01, 0x02, 0x03
+EV_SYN, EV_KEY, EV_REL = 0x00, 0x01, 0x02
 SYN_REPORT = 0
 REL_X, REL_Y, REL_HWHEEL, REL_WHEEL = 0x00, 0x01, 0x06, 0x08
-ABS_X, ABS_Y = 0x00, 0x01
 
 MOUSE_BUTTONS = {0x110: 1, 0x111: 2, 0x112: 3, 0x113: 4, 0x114: 5}
 BUTTON_TO_EVDEV = {v: k for k, v in MOUSE_BUTTONS.items()}
@@ -154,41 +153,37 @@ def list_devices():
     return mice, keyboards
 
 
-class VirtualPointer:
-    """Ponteiro absoluto + botões + roda + teclado virtual via /dev/uinput no Servidor Linux."""
+class VirtualInput:
+    """Mouse relativo (REL_X, REL_Y) + botões + roda + teclado virtual via /dev/uinput no Servidor Linux."""
 
-    def __init__(self, width, height):
-        self.fd = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
-        for t in (EV_SYN, EV_KEY, EV_REL, EV_ABS):
-            fcntl.ioctl(self.fd, UI_SET_EVBIT, t)
-        for code in MOUSE_BUTTONS:
-            fcntl.ioctl(self.fd, UI_SET_KEYBIT, code)
-        for code in (REL_WHEEL, REL_HWHEEL):
-            fcntl.ioctl(self.fd, UI_SET_RELBIT, code)
-        for code in (ABS_X, ABS_Y):
-            fcntl.ioctl(self.fd, UI_SET_ABSBIT, code)
-
-        absmax = [0] * 64
-        absmax[ABS_X] = width - 1
-        absmax[ABS_Y] = height - 1
+    def __init__(self):
         zeros = [0] * 64
-        name = (VIRTUAL_PREFIX + " Pointer").encode()
-        os.write(
-            self.fd,
-            struct.pack("80sHHHHI64i64i64i64i", name, 0x03, 0x1234, 0x5679, 1, 0, *absmax, *zeros, *zeros, *zeros),
-        )
-        fcntl.ioctl(self.fd, UI_DEV_CREATE)
+        # Mouse relativo virtual (funciona nativamente no GNOME Wayland e X11)
+        self.mouse_fd = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
+        for t in (EV_SYN, EV_KEY, EV_REL):
+            fcntl.ioctl(self.mouse_fd, UI_SET_EVBIT, t)
+        for code in MOUSE_BUTTONS:
+            fcntl.ioctl(self.mouse_fd, UI_SET_KEYBIT, code)
+        for code in (REL_X, REL_Y, REL_WHEEL, REL_HWHEEL):
+            fcntl.ioctl(self.mouse_fd, UI_SET_RELBIT, code)
 
-        # Teclado virtual separado para injetar teclas vindas do Cliente Windows 11
+        m_name = (VIRTUAL_PREFIX + " Mouse").encode()
+        os.write(
+            self.mouse_fd,
+            struct.pack("80sHHHHI64i64i64i64i", m_name, 0x03, 0x1234, 0x5679, 1, 0, *zeros, *zeros, *zeros, *zeros),
+        )
+        fcntl.ioctl(self.mouse_fd, UI_DEV_CREATE)
+
+        # Teclado virtual
         self.kbd_fd = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
         fcntl.ioctl(self.kbd_fd, UI_SET_EVBIT, EV_SYN)
         fcntl.ioctl(self.kbd_fd, UI_SET_EVBIT, EV_KEY)
         for k in range(1, 249):
             fcntl.ioctl(self.kbd_fd, UI_SET_KEYBIT, k)
-        kbd_name = (VIRTUAL_PREFIX + " Keyboard").encode()
+        k_name = (VIRTUAL_PREFIX + " Keyboard").encode()
         os.write(
             self.kbd_fd,
-            struct.pack("80sHHHHI64i64i64i64i", kbd_name, 0x03, 0x1234, 0x567A, 1, 0, *zeros, *zeros, *zeros, *zeros),
+            struct.pack("80sHHHHI64i64i64i64i", k_name, 0x03, 0x1234, 0x567A, 1, 0, *zeros, *zeros, *zeros, *zeros),
         )
         fcntl.ioctl(self.kbd_fd, UI_DEV_CREATE)
 
@@ -198,14 +193,20 @@ class VirtualPointer:
     def _write(self, fd, *events):
         os.write(fd, b"".join(events) + ev(EV_SYN, SYN_REPORT, 0))
 
-    def move(self, x, y):
-        self._write(self.fd, ev(EV_ABS, ABS_X, x), ev(EV_ABS, ABS_Y, y))
+    def move_rel(self, dx, dy):
+        evts = []
+        if dx:
+            evts.append(ev(EV_REL, REL_X, dx))
+        if dy:
+            evts.append(ev(EV_REL, REL_Y, dy))
+        if evts:
+            self._write(self.mouse_fd, *evts)
 
     def button(self, button_num, down):
         code = BUTTON_TO_EVDEV.get(int(button_num))
         if not code:
             return
-        self._write(self.fd, ev(EV_KEY, code, 1 if down else 0))
+        self._write(self.mouse_fd, ev(EV_KEY, code, 1 if down else 0))
         if down:
             self.pressed_buttons.add(code)
         else:
@@ -213,9 +214,9 @@ class VirtualPointer:
 
     def wheel(self, dy, dx):
         if dy:
-            self._write(self.fd, ev(EV_REL, REL_WHEEL, dy))
+            self._write(self.mouse_fd, ev(EV_REL, REL_WHEEL, dy))
         if dx:
-            self._write(self.fd, ev(EV_REL, REL_HWHEEL, dx))
+            self._write(self.mouse_fd, ev(EV_REL, REL_HWHEEL, dx))
 
     def key(self, code, down):
         c = int(code)
@@ -228,7 +229,7 @@ class VirtualPointer:
 
     def release_all(self):
         for code in list(self.pressed_buttons):
-            self._write(self.fd, ev(EV_KEY, code, 0))
+            self._write(self.mouse_fd, ev(EV_KEY, code, 0))
         for code in list(self.pressed_keys):
             self._write(self.kbd_fd, ev(EV_KEY, code, 0))
         self.pressed_buttons.clear()
@@ -236,7 +237,7 @@ class VirtualPointer:
 
     def close(self):
         self.release_all()
-        for f in (self.fd, self.kbd_fd):
+        for f in (self.mouse_fd, self.kbd_fd):
             try:
                 fcntl.ioctl(f, UI_DEV_DESTROY)
             except OSError:
@@ -255,8 +256,8 @@ class Capture:
         self.speed = float(cfg.get("speed", 1.0))
         self.accel = float(cfg.get("accel", 1.0))
 
-        self.remote = False  # True quando Servidor controla Cliente
-        self.client_controlling = False  # True quando Cliente controla Servidor
+        self.remote = False  # True quando mouse/teclado do Servidor controla o Cliente
+        self.client_controlling = False  # True quando mouse/teclado do Cliente está na tela do Servidor
         self.edge_notified = False
         self.x = self.width // 2
         self.y = self.height // 2
@@ -265,7 +266,7 @@ class Capture:
         self.cooldown_until = 0.0
         self.last_pos_sent = 0.0
 
-        self.pointer = None
+        self.vinput = None
         self.clipboard = LinuxClipboard()
         self.mouse_fds = {}
         self.kbd_fds = {}
@@ -278,11 +279,11 @@ class Capture:
             raise RuntimeError("Nenhum mouse encontrado em /proc/bus/input/devices")
 
         try:
-            self.pointer = VirtualPointer(self.width, self.height)
+            self.vinput = VirtualInput()
             time.sleep(0.2)
         except OSError as e:
             log("Aviso: uinput indisponível (%s)" % e)
-            self.pointer = None
+            self.vinput = None
 
         for path in mice:
             try:
@@ -324,9 +325,9 @@ class Capture:
                 pass
         self.mouse_fds.clear()
         self.kbd_fds.clear()
-        if self.pointer:
-            self.pointer.close()
-            self.pointer = None
+        if self.vinput:
+            self.vinput.close()
+            self.vinput = None
 
     def run(self):
         stdin_fd = sys.stdin.fileno()
@@ -387,14 +388,14 @@ class Capture:
             elif cmd == "inject_move":
                 self.on_inject_move(int(msg.get("dx", 0)), int(msg.get("dy", 0)))
             elif cmd == "inject_button":
-                if self.client_controlling and self.pointer:
-                    self.pointer.button(int(msg.get("button", 1)), bool(msg.get("down")))
+                if self.client_controlling and self.vinput:
+                    self.vinput.button(int(msg.get("button", 1)), bool(msg.get("down")))
             elif cmd == "inject_wheel":
-                if self.client_controlling and self.pointer:
-                    self.pointer.wheel(int(msg.get("dy", 0)), int(msg.get("dx", 0)))
+                if self.client_controlling and self.vinput:
+                    self.vinput.wheel(int(msg.get("dy", 0)), int(msg.get("dx", 0)))
             elif cmd == "inject_key":
-                if self.client_controlling and self.pointer:
-                    self.pointer.key(int(msg.get("code", 0)), bool(msg.get("down")))
+                if self.client_controlling and self.vinput:
+                    self.vinput.key(int(msg.get("code", 0)), bool(msg.get("down")))
             elif cmd == "clipboard":
                 self.clipboard.write(msg.get("text", ""))
             elif cmd == "config":
@@ -408,16 +409,14 @@ class Capture:
             elif cmd == "center":
                 self.x = self.width // 2
                 self.y = self.height // 2
-                if self.pointer:
-                    self.pointer.move(self.x, self.y)
                 send({"type": "pos", "x": self.x, "y": self.y})
         return True
 
     def on_client_enter(self, ratio):
         self.client_controlling = True
-        self.cooldown_until = time.monotonic() + 0.30
+        self.cooldown_until = time.monotonic() + 0.35
         r = min(max(float(ratio if ratio is not None else 0.5), 0.0), 1.0)
-        offset = 40
+        offset = 50
         if self.edge == "right":
             self.x = max(0, self.width - offset)
             self.y = int(r * (self.height - 1))
@@ -431,18 +430,19 @@ class Capture:
             self.x = int(r * (self.width - 1))
             self.y = max(0, self.height - offset)
 
-        if self.pointer:
-            self.pointer.move(self.x, self.y)
         send({"type": "pos", "x": self.x, "y": self.y})
 
     def on_client_leave(self):
         self.client_controlling = False
-        if self.pointer:
-            self.pointer.release_all()
+        if self.vinput:
+            self.vinput.release_all()
 
     def on_inject_move(self, dx, dy):
         if not self.client_controlling:
             return
+        if self.vinput:
+            self.vinput.move_rel(dx, dy)
+
         nx = self.x + dx
         ny = self.y + dy
         now = time.monotonic()
@@ -465,16 +465,14 @@ class Capture:
 
             if hit:
                 self.client_controlling = False
-                if self.pointer:
-                    self.pointer.release_all()
-                self.cooldown_until = now + 0.30
+                if self.vinput:
+                    self.vinput.release_all()
+                self.cooldown_until = now + 0.35
                 send({"type": "client_return", "yRatio": round(ratio, 4)})
                 return
 
         self.x = min(max(nx, 0), self.width - 1)
         self.y = min(max(ny, 0), self.height - 1)
-        if self.pointer:
-            self.pointer.move(self.x, self.y)
 
         if now - self.last_pos_sent >= 0.033:
             self.last_pos_sent = now
@@ -516,11 +514,16 @@ class Capture:
                 send({"type": "key", "code": c, "down": v != 0})
 
     def on_motion(self, dx, dy):
+        # Quando o Servidor está controlando o Cliente, envia deltas ao Cliente
         if self.remote:
             send({"type": "move", "dx": dx, "dy": dy})
             return
-        if self.client_controlling:
-            return
+
+        # O mouse físico do Servidor SEMPRE funciona no Servidor!
+        # Se o Cliente estava controlando o Servidor e você moveu o mouse físico do Servidor:
+        if self.client_controlling and (abs(dx) + abs(dy) > 8):
+            self.on_client_leave()
+            send({"type": "client_return", "yRatio": 0.5})
 
         speed = math.hypot(dx, dy)
         factor = self.speed * (1.0 + self.accel * min(speed, 30.0) / 30.0)
@@ -609,10 +612,10 @@ class Capture:
                 except OSError:
                     pass
             self.remote = False
-            self.cooldown_until = time.monotonic() + 0.30
+            self.cooldown_until = time.monotonic() + 0.35
             r = float(ratio) if ratio is not None else 0.5
             r = min(max(r, 0.0), 1.0)
-            offset = 40
+            offset = 50
             if self.edge == "right":
                 self.x = max(0, self.width - offset)
                 self.y = int(r * (self.height - 1))
@@ -627,8 +630,6 @@ class Capture:
                 self.y = max(0, self.height - offset)
 
             self.frac_x = self.frac_y = 0.0
-            if self.pointer:
-                self.pointer.move(self.x, self.y)
             send({"type": "pos", "x": self.x, "y": self.y})
         self.edge_notified = False
 

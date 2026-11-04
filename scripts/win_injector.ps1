@@ -479,7 +479,8 @@ public static class KvmInjector
 
     private static void MoveCursorAbsolute(int x, int y)
     {
-        SetCursorPos(x, y);
+        // Usa exclusivamente SendInput (que marca a flag LLMHF_INJECTED = 1),
+        // evitando que o SetCursorPos dispare o hook físico WH_MOUSE_LL por engano!
         int normX = vw > 1 ? (int)Math.Round(((double)(x - vx) * 65535.0) / (vw - 1)) : 0;
         int normY = vh > 1 ? (int)Math.Round(((double)(y - vy) * 65535.0) / (vh - 1)) : 0;
         Mouse(normX, normY, 0, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK);
@@ -580,8 +581,9 @@ public static class KvmInjector
 
             if (hit)
             {
+                PlaceAtReturnEdge(ratio);
+                cooldownUntilTick = Environment.TickCount + 500;
                 active = false;
-                cooldownUntilTick = Environment.TickCount + 300;
                 ReleaseAll();
                 CheckAndSendClipboard();
                 WriteOut("r " + ratio.ToString("0.0000", CultureInfo.InvariantCulture));
