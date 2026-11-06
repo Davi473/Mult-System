@@ -1,6 +1,18 @@
 import http from 'http';
 import { Edge } from './protocol';
 
+export interface ClientInfo {
+  id: string;
+  name: string;
+  address: string;
+  edge: Edge;
+  authenticated: boolean;
+  screen: { width: number; height: number };
+  rttMs: number;
+  packetsSec: number;
+  active: boolean;
+}
+
 export interface KVMState {
   clientConnected: boolean;
   clientAddress: string | null;
@@ -10,13 +22,23 @@ export interface KVMState {
   mouseAccel: number;
   serverScreen: { width: number; height: number };
   clientScreen: { width: number; height: number };
-  cursor: { screen: 'server' | 'client'; x: number; y: number };
+  cursor: { screen: string; x: number; y: number };
+  clients: ClientInfo[];
+  security: {
+    tlsEnabled: boolean;
+    authRequired: boolean;
+  };
+  stats: {
+    totalPacketsSec: number;
+    uptimeSeconds: number;
+  };
+  events: string[];
 }
 
 export interface FrontendHandlers {
   getState: () => KVMState;
-  onUpdateConfig: (cfg: { edge?: Edge; speed?: number; accel?: number }) => void;
-  onForceSwitch: (toRemote: boolean) => void;
+  onUpdateConfig: (cfg: { edge?: Edge; clientId?: string; speed?: number; accel?: number }) => void;
+  onForceSwitch: (toRemote: boolean, targetClientId?: string) => void;
   onCenterCursor: () => void;
 }
 
@@ -65,7 +87,7 @@ export class WebDashboard {
         req.on('end', () => {
           try {
             const data = JSON.parse(body || '{}');
-            this.handlers.onForceSwitch(Boolean(data.remote));
+            this.handlers.onForceSwitch(Boolean(data.remote), data.clientId);
             this.broadcast();
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ ok: true }));
@@ -112,151 +134,194 @@ const HTML_PAGE = `<!DOCTYPE html>
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Mult-System KVM — Configuração Visual de Telas</title>
+  <title>Mult-System KVM — Painel de Controle Multi-Dispositivos</title>
   <style>
     :root {
-      --bg: #0f172a;
-      --panel: #1e293b;
-      --border: #334155;
+      --bg: #0b0f19;
+      --panel: #131d31;
+      --panel-hover: #1b2842;
+      --border: #24344d;
       --text: #f8fafc;
       --muted: #94a3b8;
       --accent: #38bdf8;
       --green: #22c55e;
       --amber: #f59e0b;
       --danger: #ef4444;
+      --purple: #a855f7;
     }
     * { box-sizing: border-box; margin: 0; padding: 0; font-family: system-ui, -apple-system, sans-serif; }
-    body { background: var(--bg); color: var(--text); min-height: 100vh; padding: 24px; }
-    .container { max-width: 1060px; margin: 0 auto; display: grid; gap: 20px; }
+    body { background: var(--bg); color: var(--text); min-height: 100vh; padding: 20px; }
+    .container { max-width: 1200px; margin: 0 auto; display: grid; gap: 18px; }
+    
     header {
       display: flex; justify-content: space-between; align-items: center;
-      background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 18px 24px;
+      background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 16px 22px;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.3);
     }
     header h1 { font-size: 1.25rem; font-weight: 700; display: flex; align-items: center; gap: 10px; }
-    .badges { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+    .badges { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
     .badge {
-      padding: 6px 12px; border-radius: 999px; font-size: 0.8rem; font-weight: 600;
-      background: #0f172a; border: 1px solid var(--border); display: flex; align-items: center; gap: 6px;
+      padding: 5px 12px; border-radius: 999px; font-size: 0.78rem; font-weight: 600;
+      background: #090e17; border: 1px solid var(--border); display: flex; align-items: center; gap: 6px;
     }
     .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
     .dot.online { background: var(--green); box-shadow: 0 0 8px var(--green); }
     .dot.active { background: var(--accent); box-shadow: 0 0 8px var(--accent); }
 
-    .grid { display: grid; grid-template-columns: 1fr 330px; gap: 20px; }
-    @media (max-width: 860px) { .grid { grid-template-columns: 1fr; } }
+    .metrics-row {
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 14px;
+    }
+    .metric-card {
+      background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 14px 18px;
+      display: flex; flex-direction: column; gap: 4px;
+    }
+    .metric-title { font-size: 0.75rem; color: var(--muted); text-transform: uppercase; font-weight: 600; }
+    .metric-value { font-size: 1.35rem; font-weight: 800; color: var(--text); display: flex; align-items: center; gap: 8px; }
+
+    .grid { display: grid; grid-template-columns: 1fr 340px; gap: 18px; }
+    @media (max-width: 960px) { .grid { grid-template-columns: 1fr; } }
 
     .card {
       background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 20px;
     }
-    .card h2 { font-size: 1rem; margin-bottom: 6px; color: var(--text); }
-    .card p.sub { font-size: 0.83rem; color: var(--muted); margin-bottom: 16px; }
+    .card h2 { font-size: 1rem; margin-bottom: 6px; color: var(--text); display: flex; align-items: center; justify-content: space-between; }
+    .card p.sub { font-size: 0.82rem; color: var(--muted); margin-bottom: 14px; }
 
     /* Palco de Monitores */
     .stage {
-      position: relative; height: 430px; background: #090d16;
+      position: relative; height: 420px; background: #070a12;
       border: 1px dashed var(--border); border-radius: 12px; overflow: hidden;
       user-select: none;
     }
     .snap-zone {
-      position: absolute; border: 2px dashed rgba(56, 189, 248, 0.22);
+      position: absolute; border: 2px dashed rgba(56, 189, 248, 0.25);
       border-radius: 10px; display: flex; align-items: center; justify-content: center;
-      color: rgba(148, 163, 184, 0.45); font-size: 0.78rem; font-weight: 600;
+      color: rgba(148, 163, 184, 0.5); font-size: 0.78rem; font-weight: 600;
       transition: all 0.15s ease; cursor: pointer;
     }
     .snap-zone:hover, .snap-zone.highlight {
-      border-color: var(--accent); background: rgba(56, 189, 248, 0.08); color: var(--accent);
+      border-color: var(--accent); background: rgba(56, 189, 248, 0.1); color: var(--accent);
     }
 
     .monitor {
-      position: absolute; width: 184px; height: 108px; border-radius: 10px;
-      background: #1e293b; border: 2px solid #475569;
+      position: absolute; width: 180px; height: 105px; border-radius: 10px;
+      background: #192338; border: 2px solid #3b4e6d;
       display: flex; flex-direction: column; align-items: center; justify-content: center;
-      box-shadow: 0 10px 25px rgba(0,0,0,0.45); transition: box-shadow 0.2s, border-color 0.2s;
+      box-shadow: 0 10px 25px rgba(0,0,0,0.5); transition: box-shadow 0.2s, border-color 0.2s;
     }
-    .monitor.active-screen {
-      border-color: var(--green);
-      box-shadow: 0 0 0 3px rgba(34, 197, 94, 0.25), 0 12px 30px rgba(0,0,0,0.6);
+    .monitor.server {
+      cursor: default; background: linear-gradient(145deg, #1e293b, #0f172a);
+      border-color: #475569; z-index: 5;
     }
-    .monitor.server { cursor: default; background: linear-gradient(145deg, #1e293b, #0f172a); }
-    .monitor.client {
-      cursor: grab; background: linear-gradient(145deg, #172554, #0f172a);
+    .monitor.client-tile {
+      cursor: grab; background: linear-gradient(145deg, #14244d, #0b152d);
       border-color: var(--accent); z-index: 10;
     }
-    .monitor.client:active { cursor: grabbing; }
-    .monitor .num {
-      font-size: 1.5rem; font-weight: 800; color: rgba(255,255,255,0.9); line-height: 1;
+    .monitor.client-tile:active { cursor: grabbing; }
+    .monitor.active-screen {
+      border-color: var(--green);
+      box-shadow: 0 0 0 3px rgba(34, 197, 94, 0.3), 0 12px 30px rgba(0,0,0,0.6);
     }
-    .monitor .title { font-size: 0.8rem; font-weight: 600; margin-top: 4px; }
-    .monitor .res { font-size: 0.7rem; color: var(--muted); margin-top: 2px; }
+    .monitor .num { font-size: 1.4rem; font-weight: 800; color: rgba(255,255,255,0.9); line-height: 1; }
+    .monitor .title { font-size: 0.78rem; font-weight: 600; margin-top: 4px; text-align: center; max-width: 90%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .monitor .res { font-size: 0.68rem; color: var(--muted); margin-top: 2px; }
+    .monitor .ping-pill {
+      position: absolute; bottom: 6px; right: 6px; font-size: 0.65rem; font-weight: 700;
+      padding: 1px 5px; border-radius: 999px; background: rgba(0,0,0,0.6); color: var(--green);
+    }
 
-    /* Ponteiro em tempo real dentro da miniatura */
     .cursor-dot {
       position: absolute; width: 10px; height: 10px; border-radius: 50%;
       background: #f43f5e; border: 2px solid #fff;
       box-shadow: 0 0 10px #f43f5e; transform: translate(-50%, -50%);
-      pointer-events: none; z-index: 20;
+      pointer-events: none; z-index: 30;
     }
 
-    .controls { display: flex; flex-direction: column; gap: 16px; }
-    .edge-buttons { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    .controls { display: flex; flex-direction: column; gap: 14px; }
     button {
-      background: #0f172a; color: var(--text); border: 1px solid var(--border);
-      padding: 10px 12px; border-radius: 8px; font-size: 0.85rem; font-weight: 600;
+      background: #090e17; color: var(--text); border: 1px solid var(--border);
+      padding: 9px 12px; border-radius: 8px; font-size: 0.82rem; font-weight: 600;
       cursor: pointer; transition: all 0.15s;
     }
     button:hover { border-color: var(--accent); color: var(--accent); }
-    button.active {
-      background: rgba(56, 189, 248, 0.15); border-color: var(--accent); color: var(--accent);
+    button.primary { background: var(--accent); color: #090e17; border-color: var(--accent); }
+    button.primary:hover { filter: brightness(1.1); color: #090e17; }
+
+    .client-list { display: flex; flex-direction: column; gap: 8px; margin-top: 6px; }
+    .client-row {
+      background: #090e17; border: 1px solid var(--border); border-radius: 8px; padding: 10px;
+      display: flex; justify-content: space-between; align-items: center; font-size: 0.8rem;
     }
-    button.primary {
-      background: var(--accent); color: #0f172a; border-color: var(--accent);
+    .client-row-info { display: flex; flex-direction: column; gap: 2px; }
+    .client-row-name { font-weight: 700; color: var(--text); }
+    .client-row-sub { font-size: 0.72rem; color: var(--muted); }
+
+    .events-log {
+      height: 110px; overflow-y: auto; background: #070a12; border: 1px solid var(--border);
+      border-radius: 8px; padding: 8px; font-family: monospace; font-size: 0.72rem; color: #94a3b8;
+      display: flex; flex-direction: column; gap: 4px;
     }
-    button.primary:hover { filter: brightness(1.1); color: #0f172a; }
+    .events-log div { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
     .field { display: flex; flex-direction: column; gap: 6px; }
-    .field label { font-size: 0.82rem; color: var(--muted); display: flex; justify-content: space-between; }
+    .field label { font-size: 0.8rem; color: var(--muted); display: flex; justify-content: space-between; }
     input[type="range"] { width: 100%; accent-color: var(--accent); }
-
-    .status-box {
-      background: #0f172a; border: 1px solid var(--border); border-radius: 10px;
-      padding: 12px; font-size: 0.82rem; display: grid; gap: 6px;
-    }
-    .status-row { display: flex; justify-content: space-between; }
-    .status-row span:first-child { color: var(--muted); }
-    .kbd {
-      background: #1e293b; border: 1px solid #475569; border-radius: 4px;
-      padding: 1px 6px; font-family: monospace; font-size: 0.78rem;
-    }
   </style>
 </head>
 <body>
   <div class="container">
     <header>
-      <h1>🖥️ Mult-System KVM — Disposição de Telas</h1>
+      <h1>🖥️ Mult-System KVM — Multi-Dispositivos</h1>
       <div class="badges">
         <div class="badge">
+          <span class="dot" id="secDot"></span>
+          <span id="secText">HMAC PSK Ativo</span>
+        </div>
+        <div class="badge">
           <span class="dot" id="connDot"></span>
-          <span id="connText">Aguardando Cliente...</span>
+          <span id="connText">0 Clientes Conectados</span>
         </div>
         <div class="badge">
           <span class="dot active"></span>
-          <span id="activeScreenText">Tela Ativa: Servidor (Linux)</span>
+          <span id="activeScreenText">Servidor (Linux)</span>
         </div>
       </div>
     </header>
 
+    <div class="metrics-row">
+      <div class="metric-card">
+        <div class="metric-title">Latência (RTT)</div>
+        <div class="metric-value" id="valLatency">0 ms</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-title">Taxa de Pacotes (Mouse PPS)</div>
+        <div class="metric-value" id="valPps">0 p/s</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-title">Dispositivos Conectados</div>
+        <div class="metric-value" id="valClients">0</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-title">Criptografia / Protocolo</div>
+        <div class="metric-value" id="valProtocol" style="font-size: 1rem;">Binário Compacto</div>
+      </div>
+    </div>
+
     <div class="grid">
       <div class="card">
-        <h2>Arraste o Monitor 2 (Cliente Windows 11) para posicionar</h2>
+        <h2>
+          <span>Topologia de Monitores (Arraste os Clientes)</span>
+          <span style="font-size: 0.75rem; color: var(--muted); font-weight: normal;">Arraste para Esquerda, Direita, Cima ou Baixo</span>
+        </h2>
         <p class="sub">
-          Você pode arrastar o monitor <strong>2 (Cliente)</strong> para a Direita, Esquerda, Acima ou Abaixo do monitor <strong>1 (Servidor)</strong>, ou clicar nas zonas pontilhadas. O ponto vermelho mostra a posição do cursor em tempo real.
+          O Servidor Linux fica no centro. Arraste qualquer cliente conectado para posicioná-lo ao redor da tela central. O ponto vermelho mostra o cursor em tempo real.
         </p>
 
         <div class="stage" id="stage">
-          <div class="snap-zone" id="zone-top" onclick="setEdge('top')">⬆ Acima</div>
-          <div class="snap-zone" id="zone-bottom" onclick="setEdge('bottom')">⬇ Abaixo</div>
-          <div class="snap-zone" id="zone-left" onclick="setEdge('left')">⬅ Esquerda</div>
-          <div class="snap-zone" id="zone-right" onclick="setEdge('right')">Direita ➡</div>
+          <div class="snap-zone" id="zone-top" onclick="setFirstClientEdge('top')">⬆ Acima</div>
+          <div class="snap-zone" id="zone-bottom" onclick="setFirstClientEdge('bottom')">⬇ Abaixo</div>
+          <div class="snap-zone" id="zone-left" onclick="setFirstClientEdge('left')">⬅ Esquerda</div>
+          <div class="snap-zone" id="zone-right" onclick="setFirstClientEdge('right')">Direita ➡</div>
 
           <div class="monitor server" id="monServer">
             <div class="num">1</div>
@@ -265,24 +330,23 @@ const HTML_PAGE = `<!DOCTYPE html>
             <div class="cursor-dot" id="dotServer"></div>
           </div>
 
-          <div class="monitor client" id="monClient">
-            <div class="num">2</div>
-            <div class="title">Cliente (Windows 11)</div>
-            <div class="res" id="resClient">1920x1080</div>
-            <div class="cursor-dot" id="dotClient" style="display:none"></div>
+          <!-- Clientes renderizados dinamicamente -->
+          <div id="clientsContainer"></div>
+        </div>
+
+        <div style="margin-top: 14px;">
+          <h2 style="font-size: 0.88rem; margin-bottom: 6px;">Histórico de Eventos em Tempo Real</h2>
+          <div class="events-log" id="eventsLog">
+            <div>[KVM] Servidor iniciado e pronto para conexões.</div>
           </div>
         </div>
       </div>
 
       <div class="card controls">
         <div>
-          <h2>Posição do Cliente</h2>
-          <p class="sub">Em qual lado do Servidor Linux está o monitor do Windows 11?</p>
-          <div class="edge-buttons">
-            <button id="btn-left" onclick="setEdge('left')">⬅ À Esquerda</button>
-            <button id="btn-right" onclick="setEdge('right')">À Direita ➡</button>
-            <button id="btn-top" onclick="setEdge('top')">⬆ Acima</button>
-            <button id="btn-bottom" onclick="setEdge('bottom')">⬇ Abaixo</button>
+          <h2>Dispositivos Conectados</h2>
+          <div class="client-list" id="clientList">
+            <div style="font-size: 0.8rem; color: var(--muted); padding: 8px 0;">Nenhum cliente conectado no momento. Inicie o cliente no Windows ou outro Linux.</div>
           </div>
         </div>
 
@@ -294,24 +358,9 @@ const HTML_PAGE = `<!DOCTYPE html>
           <input type="range" id="speedRange" min="0.5" max="2.5" step="0.1" value="1.0" onchange="updateSpeed(this.value)" oninput="document.getElementById('speedVal').innerText = this.value + 'x'" />
         </div>
 
-        <div class="status-box">
-          <div class="status-row">
-            <span>Cursor Atual:</span>
-            <strong id="cursorCoords">x: 960, y: 540</strong>
-          </div>
-          <div class="status-row">
-            <span>Cliente IP:</span>
-            <strong id="clientIp">—</strong>
-          </div>
-          <div class="status-row">
-            <span>Tecla de Emergência:</span>
-            <span><span class="kbd">ScrollLock</span></span>
-          </div>
-        </div>
-
         <div style="display:grid; gap:8px; margin-top:auto">
-          <button class="primary" onclick="testSwitch()">⚡ Alternar Cursor para o Cliente Agora</button>
-          <button onclick="centerCursor()">🎯 Recalibrar / Centralizar Cursor no Linux</button>
+          <button class="primary" onclick="testSwitch()">⚡ Alternar Cursor para o Cliente Ativo</button>
+          <button onclick="centerCursor()">🎯 Centralizar / Recalibrar Cursor no Linux</button>
         </div>
       </div>
     </div>
@@ -320,18 +369,19 @@ const HTML_PAGE = `<!DOCTYPE html>
   <script>
     const stage = document.getElementById('stage');
     const monServer = document.getElementById('monServer');
-    const monClient = document.getElementById('monClient');
     const dotServer = document.getElementById('dotServer');
-    const dotClient = document.getElementById('dotClient');
+    const clientsContainer = document.getElementById('clientsContainer');
+    const clientList = document.getElementById('clientList');
+    const eventsLog = document.getElementById('eventsLog');
 
-    const W = 184, H = 108, GAP = 10;
+    const W = 180, H = 105, GAP = 10;
     let currentState = null;
-    let dragging = false;
+    let draggingClientId = null;
     let dragOffsetX = 0, dragOffsetY = 0;
 
     function getPositions() {
-      const sw = stage.clientWidth;
-      const sh = stage.clientHeight;
+      const sw = stage.clientWidth || 700;
+      const sh = stage.clientHeight || 420;
       const sx = Math.round((sw - W) / 2);
       const sy = Math.round((sh - H) / 2);
       return {
@@ -343,58 +393,62 @@ const HTML_PAGE = `<!DOCTYPE html>
       };
     }
 
-    function layoutStage(edge) {
+    function layoutStage() {
       const pos = getPositions();
       monServer.style.left = pos.server.x + 'px';
       monServer.style.top = pos.server.y + 'px';
 
       for (const side of ['right', 'left', 'top', 'bottom']) {
         const z = document.getElementById('zone-' + side);
-        z.style.left = pos[side].x + 'px';
-        z.style.top = pos[side].y + 'px';
-        z.style.width = W + 'px';
-        z.style.height = H + 'px';
-        z.classList.toggle('highlight', side === edge);
-        document.getElementById('btn-' + side).classList.toggle('active', side === edge);
-      }
-
-      if (!dragging && pos[edge]) {
-        monClient.style.left = pos[edge].x + 'px';
-        monClient.style.top = pos[edge].y + 'px';
+        if (z && pos[side]) {
+          z.style.left = pos[side].x + 'px';
+          z.style.top = pos[side].y + 'px';
+          z.style.width = W + 'px';
+          z.style.height = H + 'px';
+        }
       }
     }
 
-    monClient.addEventListener('pointerdown', (e) => {
-      dragging = true;
-      monClient.setPointerCapture(e.pointerId);
-      const rect = monClient.getBoundingClientRect();
-      dragOffsetX = e.clientX - rect.left;
-      dragOffsetY = e.clientY - rect.top;
-    });
+    async function setClientEdge(clientId, edge) {
+      await fetch('/api/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ clientId, edge }),
+      });
+    }
 
-    monClient.addEventListener('pointermove', (e) => {
-      if (!dragging) return;
-      const stageRect = stage.getBoundingClientRect();
-      const x = e.clientX - stageRect.left - dragOffsetX;
-      const y = e.clientY - stageRect.top - dragOffsetY;
-      monClient.style.left = x + 'px';
-      monClient.style.top = y + 'px';
-
-      const nearest = findNearestEdge(x, y);
-      for (const side of ['right', 'left', 'top', 'bottom']) {
-        document.getElementById('zone-' + side).classList.toggle('highlight', side === nearest);
+    async function setFirstClientEdge(edge) {
+      if (currentState && currentState.clients.length > 0) {
+        setClientEdge(currentState.clients[0].id, edge);
+      } else {
+        await fetch('/api/config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ edge }),
+        });
       }
-    });
+    }
 
-    monClient.addEventListener('pointerup', (e) => {
-      if (!dragging) return;
-      dragging = false;
-      monClient.releasePointerCapture(e.pointerId);
-      const x = parseFloat(monClient.style.left);
-      const y = parseFloat(monClient.style.top);
-      const nearest = findNearestEdge(x, y);
-      setEdge(nearest);
-    });
+    async function updateSpeed(speed) {
+      await fetch('/api/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ speed: Number(speed) }),
+      });
+    }
+
+    async function testSwitch(clientId) {
+      const nextRemote = !(currentState && currentState.remoteActive);
+      await fetch('/api/switch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ remote: nextRemote, clientId }),
+      });
+    }
+
+    async function centerCursor() {
+      await fetch('/api/center', { method: 'POST' });
+    }
 
     function findNearestEdge(x, y) {
       const pos = getPositions();
@@ -406,76 +460,130 @@ const HTML_PAGE = `<!DOCTYPE html>
       return best;
     }
 
-    async function setEdge(edge) {
-      layoutStage(edge);
-      await fetch('/api/config', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ edge }),
-      });
-    }
-
-    async function updateSpeed(speed) {
-      await fetch('/api/config', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ speed: Number(speed) }),
-      });
-    }
-
-    async function testSwitch() {
-      const nextRemote = !(currentState && currentState.remoteActive);
-      await fetch('/api/switch', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ remote: nextRemote }),
-      });
-    }
-
-    async function centerCursor() {
-      await fetch('/api/center', { method: 'POST' });
-    }
-
     function render(state) {
       currentState = state;
-      layoutStage(state.clientEdge);
+      layoutStage();
 
-      const connDot = document.getElementById('connDot');
-      const connText = document.getElementById('connText');
-      connDot.className = 'dot ' + (state.clientConnected ? 'online' : '');
-      connText.innerText = state.clientConnected ? 'Cliente Conectado' : 'Aguardando Cliente...';
-      document.getElementById('clientIp').innerText = state.clientAddress || 'Desconectado';
+      // Atualiza métricas
+      const activeClient = state.clients.find(c => c.active) || state.clients[0];
+      document.getElementById('valLatency').innerText = (activeClient ? activeClient.rttMs : 0) + ' ms';
+      document.getElementById('valPps').innerText = state.stats.totalPacketsSec + ' p/s';
+      document.getElementById('valClients').innerText = state.clients.length;
+      document.getElementById('valProtocol').innerText = state.security.tlsEnabled ? 'TLS + Binário' : 'HMAC + Binário';
 
-      document.getElementById('resServer').innerText = state.serverScreen.width + 'x' + state.serverScreen.height;
-      document.getElementById('resClient').innerText = state.clientScreen.width + 'x' + state.clientScreen.height;
+      document.getElementById('connDot').className = 'dot ' + (state.clientConnected ? 'online' : '');
+      document.getElementById('connText').innerText = state.clients.length + (state.clients.length === 1 ? ' Cliente Conectado' : ' Clientes Conectados');
+      document.getElementById('secDot').className = 'dot ' + (state.security.authRequired ? 'online' : '');
 
       monServer.classList.toggle('active-screen', !state.remoteActive);
-      monClient.classList.toggle('active-screen', state.remoteActive);
-      document.getElementById('activeScreenText').innerText =
-        state.remoteActive ? 'Tela Ativa: Cliente (Windows 11)' : 'Tela Ativa: Servidor (Linux)';
+      document.getElementById('activeScreenText').innerText = state.remoteActive && activeClient
+        ? 'Ativo: ' + activeClient.name
+        : 'Ativo: Servidor (Linux)';
 
+      document.getElementById('resServer').innerText = state.serverScreen.width + 'x' + state.serverScreen.height;
       document.getElementById('speedRange').value = state.mouseSpeed;
       document.getElementById('speedVal').innerText = state.mouseSpeed + 'x';
 
+      // Posiciona cursor no Servidor
       const c = state.cursor;
-      document.getElementById('cursorCoords').innerText =
-        (c.screen === 'client' ? '[Win] ' : '[Linux] ') + 'x: ' + Math.round(c.x) + ', y: ' + Math.round(c.y);
-
       if (c.screen === 'server') {
         dotServer.style.display = 'block';
-        dotClient.style.display = 'none';
         dotServer.style.left = ((c.x / Math.max(1, state.serverScreen.width)) * 100) + '%';
         dotServer.style.top = ((c.y / Math.max(1, state.serverScreen.height)) * 100) + '%';
       } else {
         dotServer.style.display = 'none';
-        dotClient.style.display = 'block';
-        dotClient.style.left = ((c.x / Math.max(1, state.clientScreen.width)) * 100) + '%';
-        dotClient.style.top = ((c.y / Math.max(1, state.clientScreen.height)) * 100) + '%';
+      }
+
+      // Renderiza clientes no palco
+      const pos = getPositions();
+      clientsContainer.innerHTML = '';
+
+      state.clients.forEach((client, idx) => {
+        const mon = document.createElement('div');
+        mon.className = 'monitor client-tile' + (client.active ? ' active-screen' : '');
+        mon.id = 'mon-' + client.id;
+        
+        let p = pos[client.edge] || pos.right;
+        mon.style.left = p.x + 'px';
+        mon.style.top = p.y + 'px';
+
+        mon.innerHTML = \`
+          <div class="num">\${idx + 2}</div>
+          <div class="title" title="\${client.name}">\${client.name}</div>
+          <div class="res">\${client.screen.width}x\${client.screen.height} [\${client.edge.toUpperCase()}]</div>
+          <div class="ping-pill">\${client.rttMs}ms</div>
+          <div class="cursor-dot" id="dot-\${client.id}" style="display:none"></div>
+        \`;
+
+        // Cursor do cliente
+        if (c.screen === client.id) {
+          const dot = mon.querySelector('#dot-' + client.id);
+          if (dot) {
+            dot.style.display = 'block';
+            dot.style.left = ((c.x / Math.max(1, client.screen.width)) * 100) + '%';
+            dot.style.top = ((c.y / Math.max(1, client.screen.height)) * 100) + '%';
+          }
+        }
+
+        // Drag and Drop
+        mon.addEventListener('pointerdown', (e) => {
+          draggingClientId = client.id;
+          mon.setPointerCapture(e.pointerId);
+          const rect = mon.getBoundingClientRect();
+          dragOffsetX = e.clientX - rect.left;
+          dragOffsetY = e.clientY - rect.top;
+        });
+
+        mon.addEventListener('pointermove', (e) => {
+          if (draggingClientId !== client.id) return;
+          const stageRect = stage.getBoundingClientRect();
+          const x = e.clientX - stageRect.left - dragOffsetX;
+          const y = e.clientY - stageRect.top - dragOffsetY;
+          mon.style.left = x + 'px';
+          mon.style.top = y + 'px';
+
+          const nearest = findNearestEdge(x, y);
+          for (const side of ['right', 'left', 'top', 'bottom']) {
+            document.getElementById('zone-' + side).classList.toggle('highlight', side === nearest);
+          }
+        });
+
+        mon.addEventListener('pointerup', (e) => {
+          if (draggingClientId !== client.id) return;
+          draggingClientId = null;
+          mon.releasePointerCapture(e.pointerId);
+          const x = parseFloat(mon.style.left);
+          const y = parseFloat(mon.style.top);
+          const nearest = findNearestEdge(x, y);
+          setClientEdge(client.id, nearest);
+        });
+
+        clientsContainer.appendChild(mon);
+      });
+
+      // Renderiza lista lateral de clientes
+      if (state.clients.length === 0) {
+        clientList.innerHTML = '<div style="font-size: 0.8rem; color: var(--muted); padding: 8px 0;">Nenhum cliente conectado no momento.</div>';
+      } else {
+        clientList.innerHTML = state.clients.map((client) => \`
+          <div class="client-row">
+            <div class="client-row-info">
+              <div class="client-row-name">\${client.name}</div>
+              <div class="client-row-sub">\${client.address} • Borda: <strong>\${client.edge.toUpperCase()}</strong> • \${client.rttMs}ms</div>
+            </div>
+            <button onclick="testSwitch('\${client.id}')">\${client.active ? 'Devolver' : 'Assumir'}</button>
+          </div>
+        \`).join('');
+      }
+
+      // Atualiza log de eventos
+      if (state.events && state.events.length > 0) {
+        eventsLog.innerHTML = state.events.slice(0, 15).map(ev => \`<div>\${ev}</div>\`).join('');
       }
     }
 
-    window.addEventListener('resize', () => currentState && layoutStage(currentState.clientEdge));
-    layoutStage('right');
+    window.addEventListener('resize', () => layoutStage());
+    layoutStage();
 
     const es = new EventSource('/api/events');
     es.onmessage = (ev) => render(JSON.parse(ev.data));

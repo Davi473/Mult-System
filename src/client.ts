@@ -1,12 +1,27 @@
 import net from 'net';
+import tls from 'tls';
+import os from 'os';
 import { Injector, createInjector } from './inject';
-import { InputPacket, Packet, LineReader, encode, loadEnv, parseEdge } from './protocol';
+import {
+  InputPacket,
+  Packet,
+  FrameReader,
+  MouseBatcher,
+  encodeBinary,
+  loadEnv,
+  parseEdge,
+  computeHmac,
+} from './protocol';
+import { discoverServer } from './discovery';
+import { getOrCreateSecretKey, isTLSEnabled } from './security';
 
 loadEnv();
 
 const SERVER_HOST = process.argv[2] || process.env.SERVER_HOST || 'servidor';
 const SERVER_PORT = Number(process.env.KVM_PORT) || 5000;
 const RETURN_EDGE = parseEdge(process.env.RETURN_EDGE, 'left');
+const CLIENT_NAME = process.env.CLIENT_NAME || `${os.hostname()} (${process.platform})`;
+const CLIENT_ID = process.env.CLIENT_ID || `${os.hostname()}-${process.pid}`;
 
 const isIp = net.isIP(SERVER_HOST) !== 0;
 const HOSTS = Array.from(
@@ -25,35 +40,60 @@ class KVMClient {
   private socket: net.Socket | null = null;
   private active = false;
   private hostIndex = 0;
+  private reconnectAttempts = 0;
+  private mouseBatcher: MouseBatcher;
+  private secretKey: string;
 
   constructor(private readonly injector: Injector) {
+    this.secretKey = getOrCreateSecretKey();
+
+    this.mouseBatcher = new MouseBatcher((dx, dy) => {
+      this.send({ type: 'move', dx, dy });
+    });
+
     injector.on('return', (yRatio: number) => {
       if (!this.active) return;
       this.active = false;
       console.log('[Cliente] Borda de retorno atingida -> devolvendo controle ao Servidor.');
       this.send({ type: 'return', yRatio });
     });
+
     injector.on('pos', (pos: { x: number; y: number }) => {
       if (this.active) {
         this.send({ type: 'client_pos', x: pos.x, y: pos.y });
       }
     });
-    injector.on('clipboard', (text: string) => {
-      this.send({ type: 'clipboard', text });
-      console.log('[Cliente] Área de transferência enviada para o Servidor Linux.');
+
+    injector.on('clipboard', (data: { format?: string; text?: string; image?: string }) => {
+      this.send({
+        type: 'clipboard',
+        format: data.format as 'text' | 'image',
+        text: data.text,
+        image: data.image,
+      });
+      console.log(`[Cliente] Área de transferência enviada (${data.format || 'text'}).`);
     });
+
     injector.on('client_enter', (yRatio: number) => {
       this.active = false;
       console.log('[Cliente] Borda atingida -> Mouse/Teclado do Cliente agora controlando o Servidor Linux!');
       this.send({ type: 'client_enter', yRatio });
     });
+
     injector.on('client_leave', () => {
       console.log('[Cliente] ScrollLock -> Controle voltou para o Cliente.');
       this.send({ type: 'client_leave' });
     });
+
     injector.on('client_input', (pkt: InputPacket) => {
-      this.send(pkt);
+      if (pkt.type === 'move') {
+        this.mouseBatcher.push(pkt.dx, pkt.dy);
+      } else {
+        this.mouseBatcher.flush();
+        this.send(pkt);
+      }
     });
+
     injector.on('exit', (code: number) => {
       console.error(`[Cliente] Injetor encerrou (código ${code}). Saindo.`);
       process.exit(1);
@@ -61,66 +101,135 @@ class KVMClient {
   }
 
   private send(packet: Packet) {
-    if (this.socket && !this.socket.destroyed) this.socket.write(encode(packet));
+    if (this.socket && !this.socket.destroyed) {
+      this.socket.write(encodeBinary(packet));
+    }
   }
 
-  connect() {
-    const host = HOSTS[this.hostIndex % HOSTS.length];
-    const socket = new net.Socket();
+  async connect() {
+    let host = HOSTS[this.hostIndex % HOSTS.length];
+    let port = SERVER_PORT;
+
+    // Tenta autodescoberta UDP na rede local na primeira tentativa ou a cada ciclo
+    if (this.reconnectAttempts === 0 || this.hostIndex % HOSTS.length === 0) {
+      try {
+        console.log('[Cliente] Procurando Servidor KVM automaticamente na rede local (mDNS/UDP)...');
+        const discovered = await discoverServer({ timeoutMs: 1500 });
+        if (discovered) {
+          console.log(`[Cliente] Servidor descoberto automaticamente em: ${discovered.host}:${discovered.port} (${discovered.name})`);
+          host = discovered.host;
+          port = discovered.port;
+        }
+      } catch {
+        // Fallback silencioso para lista estática
+      }
+    }
+
     let connected = false;
-    console.log(`[Cliente] Conectando em ${host}:${SERVER_PORT}...`);
+    const useTLS = isTLSEnabled();
+    console.log(`[Cliente] Conectando em ${host}:${port} (${useTLS ? 'TLS Seguro' : 'TCP'})...`);
 
-    socket.setTimeout(4000);
-    socket.on('timeout', () => {
-      if (!connected) socket.destroy(new Error('tempo esgotado'));
-    });
-
-    socket.connect({ host, port: SERVER_PORT, family: 4 }, () => {
+    const onConnect = () => {
       connected = true;
+      this.reconnectAttempts = 0;
       socket.setTimeout(0);
       socket.setNoDelay(true);
       socket.setKeepAlive(true, 2000);
       this.socket = socket;
-      console.log(`[Cliente] Conectado ao Servidor ${host}:${SERVER_PORT}.`);
+      console.log(`[Cliente] Conexão estabelecida com ${host}:${port}. Aguardando autenticação...`);
+
+      // Envia informações iniciais do cliente
       this.send({
         type: 'client_info',
+        name: CLIENT_NAME,
+        id: CLIENT_ID,
         width: this.injector.screenWidth,
         height: this.injector.screenHeight,
       });
+    };
+
+    const socket: net.Socket = useTLS
+      ? tls.connect({ host, port, rejectUnauthorized: false }, onConnect)
+      : net.connect({ host, port, family: 4 }, onConnect);
+
+    socket.setTimeout(4000);
+    socket.on('timeout', () => {
+      if (!connected) socket.destroy(new Error('tempo esgotado de conexão'));
     });
 
-    const reader = new LineReader((line) => {
+    const reader = new FrameReader(
+      (packet) => {
+        try {
+          this.handle(packet);
+        } catch (err) {
+          console.error('[Cliente] Erro ao processar pacote:', (err as Error).message);
+        }
+      },
+      { maxBufferSize: 10 * 1024 * 1024 }
+    );
+
+    socket.on('data', (chunk) => {
       try {
-        this.handle(JSON.parse(line) as Packet);
+        reader.push(chunk);
       } catch (err) {
-        console.error('[Cliente] Pacote inválido:', (err as Error).message);
+        console.error('[Cliente] Erro de protocolo / overflow:', (err as Error).message);
+        socket.destroy();
       }
     });
-    socket.on('data', (chunk) => reader.push(chunk));
 
-    socket.on('error', (err) => console.error(`[Cliente] Erro (${host}): ${err.message}`));
+    socket.on('error', (err) => console.error(`[Cliente] Erro no socket (${host}): ${err.message}`));
+
     socket.on('close', () => {
       if (this.socket === socket) this.socket = null;
       if (this.active) {
         this.active = false;
         this.injector.leave();
       }
-      if (!connected) this.hostIndex++;
-      console.log('[Cliente] Desconectado. Nova tentativa em 2s...');
-      setTimeout(() => this.connect(), 2000);
+      if (!connected) {
+        this.hostIndex++;
+      }
+      this.reconnectAttempts++;
+
+      // Exponential Backoff com Jitter
+      const baseDelay = Math.min(15000, 1000 * Math.pow(1.5, Math.min(this.reconnectAttempts, 7)));
+      const jitter = Math.floor(Math.random() * 500);
+      const delay = Math.round(baseDelay + jitter);
+
+      console.log(`[Cliente] Desconectado. Nova tentativa em ${(delay / 1000).toFixed(1)}s (tentativa #${this.reconnectAttempts})...`);
+      setTimeout(() => this.connect(), delay);
     });
   }
 
   private handle(packet: Packet) {
     switch (packet.type) {
+      case 'auth_challenge': {
+        const hmac = computeHmac(this.secretKey, packet.nonce);
+        this.send({
+          type: 'auth_response',
+          hmac,
+          clientName: CLIENT_NAME,
+          clientId: CLIENT_ID,
+        });
+        console.log('[Cliente] Desafio de autenticação recebido. Resposta HMAC enviada.');
+        break;
+      }
+      case 'auth_success':
+        console.log(`[Cliente] Autenticado com sucesso no Servidor! (ID: ${packet.clientId})`);
+        break;
+      case 'auth_fail':
+        console.error(`[Cliente] Falha de autenticação: ${packet.reason}. Verifique a KVM_SECRET_KEY no .env.`);
+        break;
+      case 'ping':
+        this.send({ type: 'pong', seq: packet.seq, timestamp: packet.timestamp });
+        break;
       case 'config':
         this.injector.setReturnEdge(packet.returnEdge);
         console.log(`[Cliente] Borda de retorno atualizada pelo Servidor: ${packet.returnEdge.toUpperCase()}`);
         break;
       case 'clipboard':
-        if (packet.text) {
-          this.injector.setClipboard(packet.text);
-          console.log('[Cliente] Área de transferência recebida do Servidor Linux.');
+        if (packet.text || packet.image) {
+          this.injector.setClipboard(packet);
+          console.log(`[Cliente] Área de transferência recebida do Servidor (${packet.format || 'text'}).`);
         }
         break;
       case 'enter':

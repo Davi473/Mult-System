@@ -6,13 +6,17 @@ Captura e Injeção bidirecional de mouse/teclado + Clipboard do SERVIDOR KVM no
 - O mouse e teclado físicos do Cliente Windows 11, ao cruzar a borda para o Linux, movem o cursor e
   digitam no Linux via /dev/uinput (EV_REL + EV_KEY), sem bloquear o mouse/teclado físicos do Servidor!
 """
+import base64
 import fcntl
+import hashlib
 import json
 import math
 import os
 import select
+import shutil
 import signal
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -56,17 +60,19 @@ def ev(t, c, v):
 
 
 class LinuxClipboard:
-    """Sincroniza a área de transferência do Linux (Wayland/X11) via GTK3 (forçando XWayland GDK_BACKEND=x11)."""
+    """Sincroniza texto e imagens da área de transferência do Linux com fallback: GTK3 -> wl-clipboard -> xclip."""
 
     def __init__(self):
-        self.available = False
+        self.backend = None
         self.last_text = ""
+        self.last_img_hash = ""
         self.cb = None
         self.GLib = None
+
+        # 1. Tenta GTK3 (GDK X11/XWayland)
         try:
             os.environ["GDK_BACKEND"] = "x11"
             import gi
-
             gi.require_version("Gtk", "3.0")
             from gi.repository import Gtk, Gdk, GLib
 
@@ -74,46 +80,152 @@ class LinuxClipboard:
             self.Gdk = Gdk
             self.GLib = GLib
             self.cb = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
-            self.available = True
-            GLib.timeout_add(400, self._poll)
+            self.backend = "gtk"
+            GLib.timeout_add(400, self._poll_gtk)
             t = threading.Thread(target=Gtk.main, daemon=True)
             t.start()
+            log("Clipboard backend ativo: GTK3")
         except Exception as e:
-            log("Clipboard GTK3 indisponível: %s" % e)
+            log("Clipboard GTK3 indisponível: %s. Tentando ferramentas CLI..." % e)
 
-    def _poll(self):
+        # 2. Se GTK3 falhar, tenta wl-clipboard (Wayland nativo)
+        if not self.backend and shutil.which("wl-paste") and shutil.which("wl-copy"):
+            self.backend = "wayland"
+            log("Clipboard backend ativo: wl-clipboard (Wayland)")
+            t = threading.Thread(target=self._poll_cli_loop, daemon=True)
+            t.start()
+
+        # 3. Se wl-clipboard falhar, tenta xclip (X11)
+        if not self.backend and shutil.which("xclip"):
+            self.backend = "x11"
+            log("Clipboard backend ativo: xclip (X11)")
+            t = threading.Thread(target=self._poll_cli_loop, daemon=True)
+            t.start()
+
+        if not self.backend:
+            log("Nenhum backend de clipboard disponível. Instale wl-clipboard, xclip ou python3-gi.")
+
+    def _poll_gtk(self):
         try:
-            self.cb.request_text(self._on_text)
+            self.cb.request_text(self._on_gtk_text)
+            self.cb.request_image(self._on_gtk_image)
         except Exception:
             pass
         return True
 
-    def read_and_send(self):
-        if not self.available:
-            return
-
-        def _req():
-            self.cb.request_text(self._on_text)
-            return False
-
-        self.GLib.idle_add(_req)
-
-    def _on_text(self, _clipboard, text):
+    def _on_gtk_text(self, _clipboard, text):
         if text and text != self.last_text:
             self.last_text = text
-            send({"type": "clipboard", "text": text})
+            send({"type": "clipboard", "format": "text", "text": text})
 
-    def write(self, text):
-        if not self.available or not text:
+    def _on_gtk_image(self, _clipboard, pixbuf):
+        if not pixbuf:
+            return
+        try:
+            success, png_bytes = pixbuf.save_to_bufferv("png", [], [])
+            if success and png_bytes:
+                h = hashlib.md5(png_bytes).hexdigest()
+                if h != self.last_img_hash:
+                    self.last_img_hash = h
+                    b64 = base64.b64encode(png_bytes).decode("ascii")
+                    send({"type": "clipboard", "format": "image", "image": b64})
+        except Exception:
+            pass
+
+    def _poll_cli_loop(self):
+        while True:
+            time.sleep(0.5)
+            self._check_cli_clipboard()
+
+    def _check_cli_clipboard(self):
+        try:
+            # Checa texto
+            cmd_text = ["wl-paste", "-n"] if self.backend == "wayland" else ["xclip", "-selection", "clipboard", "-o"]
+            res = subprocess.run(cmd_text, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=1)
+            if res.returncode == 0 and res.stdout:
+                text = res.stdout.decode("utf-8", errors="replace")
+                if text and text != self.last_text:
+                    self.last_text = text
+                    send({"type": "clipboard", "format": "text", "text": text})
+                    return
+
+            # Checa imagem se texto não mudou
+            cmd_img = ["wl-paste", "-t", "image/png"] if self.backend == "wayland" else ["xclip", "-selection", "clipboard", "-t", "image/png", "-o"]
+            res_img = subprocess.run(cmd_img, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=1)
+            if res_img.returncode == 0 and res_img.stdout:
+                img_data = res_img.stdout
+                h = hashlib.md5(img_data).hexdigest()
+                if h != self.last_img_hash:
+                    self.last_img_hash = h
+                    b64 = base64.b64encode(img_data).decode("ascii")
+                    send({"type": "clipboard", "format": "image", "image": b64})
+        except Exception:
+            pass
+
+    def read_and_send(self):
+        if self.backend == "gtk":
+            def _req():
+                self.cb.request_text(self._on_gtk_text)
+                self.cb.request_image(self._on_gtk_image)
+                return False
+            self.GLib.idle_add(_req)
+        elif self.backend in ("wayland", "x11"):
+            self._check_cli_clipboard()
+
+    def write(self, text=None, image=None, format=None):
+        if image:
+            self._write_image(image)
+        elif text:
+            self._write_text(text)
+
+    def _write_text(self, text):
+        if not text:
             return
         self.last_text = text
+        if self.backend == "gtk":
+            def _set():
+                self.cb.set_text(text, -1)
+                self.cb.store()
+                return False
+            self.GLib.idle_add(_set)
+        elif self.backend == "wayland":
+            try:
+                p = subprocess.Popen(["wl-copy"], stdin=subprocess.PIPE)
+                p.communicate(text.encode("utf-8"), timeout=2)
+            except Exception as e:
+                log("Erro wl-copy: %s" % e)
+        elif self.backend == "x11":
+            try:
+                p = subprocess.Popen(["xclip", "-selection", "clipboard"], stdin=subprocess.PIPE)
+                p.communicate(text.encode("utf-8"), timeout=2)
+            except Exception as e:
+                log("Erro xclip: %s" % e)
 
-        def _set():
-            self.cb.set_text(text, -1)
-            self.cb.store()
-            return False
-
-        self.GLib.idle_add(_set)
+    def _write_image(self, b64_png):
+        if not b64_png:
+            return
+        try:
+            png_bytes = base64.b64decode(b64_png)
+            self.last_img_hash = hashlib.md5(png_bytes).hexdigest()
+            if self.backend == "gtk":
+                from gi.repository import GdkPixbuf
+                loader = GdkPixbuf.PixbufLoader.new_with_type("png")
+                loader.write(png_bytes)
+                loader.close()
+                pixbuf = loader.get_pixbuf()
+                def _set():
+                    self.cb.set_image(pixbuf)
+                    self.cb.store()
+                    return False
+                self.GLib.idle_add(_set)
+            elif self.backend == "wayland":
+                p = subprocess.Popen(["wl-copy", "-t", "image/png"], stdin=subprocess.PIPE)
+                p.communicate(png_bytes, timeout=2)
+            elif self.backend == "x11":
+                p = subprocess.Popen(["xclip", "-selection", "clipboard", "-t", "image/png"], stdin=subprocess.PIPE)
+                p.communicate(png_bytes, timeout=2)
+        except Exception as e:
+            log("Erro ao salvar imagem no clipboard: %s" % e)
 
 
 def list_devices():
@@ -259,6 +371,7 @@ class Capture:
         self.remote = False  # True quando mouse/teclado do Servidor controla o Cliente
         self.client_controlling = False  # True quando mouse/teclado do Cliente está na tela do Servidor
         self.edge_notified = False
+        self.last_crossed_edge = None
         self.x = self.width // 2
         self.y = self.height // 2
         self.frac_x = 0.0
@@ -380,9 +493,9 @@ class Capture:
                 continue
             cmd = msg.get("cmd")
             if cmd == "remote":
-                self.set_remote(bool(msg.get("on")), msg.get("yRatio"))
+                self.set_remote(bool(msg.get("on")), msg.get("yRatio"), msg.get("edge"))
             elif cmd == "client_enter":
-                self.on_client_enter(msg.get("yRatio", 0.5))
+                self.on_client_enter(msg.get("yRatio", 0.5), msg.get("edge"))
             elif cmd == "client_leave":
                 self.on_client_leave()
             elif cmd == "inject_move":
@@ -397,7 +510,7 @@ class Capture:
                 if self.client_controlling and self.vinput:
                     self.vinput.key(int(msg.get("code", 0)), bool(msg.get("down")))
             elif cmd == "clipboard":
-                self.clipboard.write(msg.get("text", ""))
+                self.clipboard.write(text=msg.get("text"), image=msg.get("image") or msg.get("data"))
             elif cmd == "config":
                 if "edge" in msg:
                     self.edge = msg["edge"]
@@ -412,18 +525,19 @@ class Capture:
                 send({"type": "pos", "x": self.x, "y": self.y})
         return True
 
-    def on_client_enter(self, ratio):
+    def on_client_enter(self, ratio, edge=None):
         self.client_controlling = True
         self.cooldown_until = time.monotonic() + 0.35
         r = min(max(float(ratio if ratio is not None else 0.5), 0.0), 1.0)
         offset = 50
-        if self.edge == "right":
+        target_edge = edge if edge else self.edge
+        if target_edge == "right":
             self.x = max(0, self.width - offset)
             self.y = int(r * (self.height - 1))
-        elif self.edge == "left":
+        elif target_edge == "left":
             self.x = min(self.width - 1, offset)
             self.y = int(r * (self.height - 1))
-        elif self.edge == "top":
+        elif target_edge == "top":
             self.x = int(r * (self.width - 1))
             self.y = min(self.height - 1, offset)
         else:
@@ -539,20 +653,20 @@ class Capture:
         ny = self.y + my
         now = time.monotonic()
 
-        crossed = False
+        crossed_edge = None
         ratio = 0.5
         if now >= self.cooldown_until:
-            if self.edge == "right" and nx >= self.width - 1 and mx > 0:
-                crossed = True
+            if nx >= self.width - 1 and mx > 0:
+                crossed_edge = "right"
                 ratio = min(max(ny, 0), self.height - 1) / float(max(1, self.height - 1))
-            elif self.edge == "left" and nx <= 0 and mx < 0:
-                crossed = True
+            elif nx <= 0 and mx < 0:
+                crossed_edge = "left"
                 ratio = min(max(ny, 0), self.height - 1) / float(max(1, self.height - 1))
-            elif self.edge == "top" and ny <= 0 and my < 0:
-                crossed = True
+            elif ny <= 0 and my < 0:
+                crossed_edge = "top"
                 ratio = min(max(nx, 0), self.width - 1) / float(max(1, self.width - 1))
-            elif self.edge == "bottom" and ny >= self.height - 1 and my > 0:
-                crossed = True
+            elif ny >= self.height - 1 and my > 0:
+                crossed_edge = "bottom"
                 ratio = min(max(nx, 0), self.width - 1) / float(max(1, self.width - 1))
 
         self.x = min(max(nx, 0), self.width - 1)
@@ -562,20 +676,17 @@ class Capture:
             self.last_pos_sent = now
             send({"type": "pos", "x": self.x, "y": self.y})
 
-        if crossed:
-            if not self.edge_notified:
+        if crossed_edge:
+            if not self.edge_notified or self.last_crossed_edge != crossed_edge:
                 self.edge_notified = True
-                send({"type": "edge", "yRatio": round(ratio, 4)})
+                self.last_crossed_edge = crossed_edge
+                send({"type": "edge", "edge": crossed_edge, "yRatio": round(ratio, 4)})
         else:
             margin = 20
-            away = (
-                (self.edge == "right" and self.x < self.width - margin)
-                or (self.edge == "left" and self.x > margin)
-                or (self.edge == "top" and self.y > margin)
-                or (self.edge == "bottom" and self.y < self.height - margin)
-            )
-            if away:
+            if (self.x > margin and self.x < self.width - margin and
+                self.y > margin and self.y < self.height - margin):
                 self.edge_notified = False
+                self.last_crossed_edge = None
 
     def on_button(self, code, down):
         if self.remote:
@@ -593,7 +704,7 @@ class Capture:
             self.on_client_leave()
             send({"type": "client_return", "yRatio": 0.5})
 
-    def set_remote(self, on, ratio):
+    def set_remote(self, on, ratio, edge=None):
         if on == self.remote:
             return
         if on:
@@ -616,16 +727,17 @@ class Capture:
             r = float(ratio) if ratio is not None else 0.5
             r = min(max(r, 0.0), 1.0)
             offset = 50
-            if self.edge == "right":
+            target_edge = edge if edge else self.edge
+            if target_edge == "right":
                 self.x = max(0, self.width - offset)
                 self.y = int(r * (self.height - 1))
-            elif self.edge == "left":
+            elif target_edge == "left":
                 self.x = min(self.width - 1, offset)
                 self.y = int(r * (self.height - 1))
-            elif self.edge == "top":
+            elif target_edge == "top":
                 self.x = int(r * (self.width - 1))
                 self.y = min(self.height - 1, offset)
-            elif self.edge == "bottom":
+            elif target_edge == "bottom":
                 self.x = int(r * (self.width - 1))
                 self.y = max(0, self.height - offset)
 

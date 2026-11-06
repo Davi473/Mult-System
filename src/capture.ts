@@ -4,13 +4,24 @@ import path from 'path';
 import { Edge, InputPacket, LineReader } from './protocol';
 import { SCRIPTS_DIR, detectLinuxScreen, ensureLinuxDeviceAccess } from './platform';
 
+export interface EdgeEvent {
+  edge: Edge;
+  yRatio: number;
+}
+
+export interface ClipboardData {
+  text?: string;
+  image?: string;
+  format?: 'text' | 'image';
+}
+
 export interface Capture extends EventEmitter {
   start(): Promise<{ width: number; height: number }>;
-  setRemote(on: boolean, yRatio?: number): void;
-  clientEnter(yRatio: number): void;
+  setRemote(on: boolean, yRatio?: number, edge?: Edge): void;
+  clientEnter(yRatio: number, edge?: Edge): void;
   clientLeave(): void;
   injectFromClient(packet: InputPacket): void;
-  setClipboard(text: string): void;
+  setClipboard(data: ClipboardData | string): void;
   updateConfig(cfg: Partial<CaptureOptions>): void;
   centerCursor(): void;
   stop(): void;
@@ -66,7 +77,10 @@ class LinuxCapture extends EventEmitter implements Capture {
             resolve({ width: Number(msg.width), height: Number(msg.height) });
             break;
           case 'edge':
-            this.emit('edge', Number(msg.yRatio));
+            this.emit('edge', {
+              edge: (msg.edge as Edge) || this.options.edge,
+              yRatio: Number(msg.yRatio ?? 0.5),
+            });
             break;
           case 'client_return':
             this.emit('client_return', Number(msg.yRatio));
@@ -75,7 +89,11 @@ class LinuxCapture extends EventEmitter implements Capture {
             this.emit('pos', { x: Number(msg.x), y: Number(msg.y) });
             break;
           case 'clipboard':
-            if (msg.text) this.emit('clipboard', String(msg.text));
+            this.emit('clipboard', {
+              text: msg.text,
+              image: msg.image,
+              format: msg.format || (msg.image ? 'image' : 'text'),
+            });
             break;
           case 'emergency':
             this.emit('emergency');
@@ -101,12 +119,12 @@ class LinuxCapture extends EventEmitter implements Capture {
     });
   }
 
-  setRemote(on: boolean, yRatio?: number): void {
-    this.proc?.stdin?.write(JSON.stringify({ cmd: 'remote', on, yRatio }) + '\n');
+  setRemote(on: boolean, yRatio?: number, edge?: Edge): void {
+    this.proc?.stdin?.write(JSON.stringify({ cmd: 'remote', on, yRatio, edge }) + '\n');
   }
 
-  clientEnter(yRatio: number): void {
-    this.proc?.stdin?.write(JSON.stringify({ cmd: 'client_enter', yRatio }) + '\n');
+  clientEnter(yRatio: number, edge?: Edge): void {
+    this.proc?.stdin?.write(JSON.stringify({ cmd: 'client_enter', yRatio, edge }) + '\n');
   }
 
   clientLeave(): void {
@@ -127,9 +145,10 @@ class LinuxCapture extends EventEmitter implements Capture {
     }
   }
 
-  setClipboard(text: string): void {
-    if (!text) return;
-    this.proc?.stdin?.write(JSON.stringify({ cmd: 'clipboard', text }) + '\n');
+  setClipboard(data: ClipboardData | string): void {
+    if (!data) return;
+    const payload = typeof data === 'string' ? { text: data } : data;
+    this.proc?.stdin?.write(JSON.stringify({ cmd: 'clipboard', ...payload }) + '\n');
   }
 
   updateConfig(cfg: Partial<CaptureOptions>): void {
@@ -222,15 +241,23 @@ class GenericCapture extends EventEmitter implements Capture {
     const cy = Math.floor(this.height / 2);
     if (!this.remote) {
       this.emit('pos', { x, y });
-      const e = this.options.edge;
-      const hit =
-        (e === 'right' && x >= this.width - 1) ||
-        (e === 'left' && x <= 0) ||
-        (e === 'top' && y <= 0) ||
-        (e === 'bottom' && y >= this.height - 1);
-      if (hit) {
-        const ratio = e === 'left' || e === 'right' ? y / (this.height - 1) : x / (this.width - 1);
-        this.emit('edge', ratio);
+      let hitEdge: Edge | null = null;
+      let ratio = 0.5;
+      if (x >= this.width - 1) {
+        hitEdge = 'right';
+        ratio = y / (this.height - 1);
+      } else if (x <= 0) {
+        hitEdge = 'left';
+        ratio = y / (this.height - 1);
+      } else if (y <= 0) {
+        hitEdge = 'top';
+        ratio = x / (this.width - 1);
+      } else if (y >= this.height - 1) {
+        hitEdge = 'bottom';
+        ratio = x / (this.width - 1);
+      }
+      if (hitEdge) {
+        this.emit('edge', { edge: hitEdge, yRatio: ratio });
       }
       return;
     }
@@ -241,12 +268,12 @@ class GenericCapture extends EventEmitter implements Capture {
     void this.warp(cx, cy);
   }
 
-  setRemote(on: boolean, yRatio = 0.5): void {
+  setRemote(on: boolean, yRatio = 0.5, edge?: Edge): void {
     this.remote = on;
     if (on) {
       void this.warp(Math.floor(this.width / 2), Math.floor(this.height / 2));
     } else {
-      const e = this.options.edge;
+      const e = edge || this.options.edge;
       const x = e === 'right' ? this.width - 40 : e === 'left' ? 40 : Math.round(yRatio * (this.width - 1));
       const y = e === 'bottom' ? this.height - 40 : e === 'top' ? 40 : Math.round(yRatio * (this.height - 1));
       void this.warp(x, y);
@@ -257,11 +284,11 @@ class GenericCapture extends EventEmitter implements Capture {
     this.options = { ...this.options, ...cfg };
   }
 
-  setClipboard(_text: string): void {
+  setClipboard(_data: ClipboardData | string): void {
     // no-op on generic fallback
   }
 
-  clientEnter(_yRatio: number): void {}
+  clientEnter(_yRatio: number, _edge?: Edge): void {}
   clientLeave(): void {}
   injectFromClient(_packet: InputPacket): void {}
 

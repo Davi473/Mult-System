@@ -46,10 +46,13 @@ export class Injector extends EventEmitter {
         } else if (line.startsWith('cb ')) {
           try {
             const text = Buffer.from(line.slice(3).trim(), 'base64').toString('utf8');
-            if (text) this.emit('clipboard', text);
+            if (text) this.emit('clipboard', { type: 'clipboard', format: 'text', text });
           } catch {
             // ignore
           }
+        } else if (line.startsWith('cb_img ')) {
+          const imgB64 = line.slice(7).trim();
+          if (imgB64) this.emit('clipboard', { type: 'clipboard', format: 'image', image: imgB64 });
         } else if (line.startsWith('cs_e ')) {
           this.emit('client_enter', Number(line.slice(5)));
         } else if (line === 'cs_l') {
@@ -88,10 +91,17 @@ export class Injector extends EventEmitter {
   setReturnEdge(edge: Edge) {
     this.write(`c ${edge}`);
   }
-  setClipboard(text: string) {
-    if (!text) return;
-    const b64 = Buffer.from(text, 'utf8').toString('base64');
-    this.write(`cb ${b64}`);
+  setClipboard(data: { text?: string; image?: string; format?: 'text' | 'image' } | string) {
+    if (!data) return;
+    if (typeof data === 'string') {
+      const b64 = Buffer.from(data, 'utf8').toString('base64');
+      this.write(`cb ${b64}`);
+    } else if (data.image) {
+      this.write(`cb_img ${data.image}`);
+    } else if (data.text) {
+      const b64 = Buffer.from(data.text, 'utf8').toString('base64');
+      this.write(`cb ${b64}`);
+    }
   }
   enter(yRatio: number) {
     this.write(`e ${Math.min(1, Math.max(0, yRatio)).toFixed(4)}`);
