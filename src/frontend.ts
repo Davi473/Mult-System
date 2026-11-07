@@ -44,11 +44,35 @@ export interface FrontendHandlers {
 
 export class WebDashboard {
   private sseClients = new Set<http.ServerResponse>();
+  private server: http.Server | null = null;
+  private broadcastTimer: NodeJS.Timeout | null = null;
+  private lastBroadcastMs = 0;
 
   constructor(private readonly port: number, private readonly handlers: FrontendHandlers) {}
 
+  private readJsonBody(req: http.IncomingMessage): Promise<any> {
+    return new Promise((resolve, reject) => {
+      let body = '';
+      req.on('data', (chunk) => {
+        body += chunk;
+        if (body.length > 65536) {
+          req.destroy();
+          reject(new Error('Payload muito grande'));
+        }
+      });
+      req.on('end', () => {
+        try {
+          resolve(body ? JSON.parse(body) : {});
+        } catch (err) {
+          reject(err);
+        }
+      });
+      req.on('error', reject);
+    });
+  }
+
   start(): void {
-    const server = http.createServer((req, res) => {
+    const server = http.createServer(async (req, res) => {
       const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
 
       if (req.method === 'GET' && url.pathname === '/api/events') {
@@ -64,44 +88,36 @@ export class WebDashboard {
       }
 
       if (req.method === 'POST' && url.pathname === '/api/config') {
-        let body = '';
-        req.on('data', (c) => (body += c));
-        req.on('end', () => {
-          try {
-            const data = JSON.parse(body);
-            this.handlers.onUpdateConfig(data);
-            this.broadcast();
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ ok: true, state: this.handlers.getState() }));
-          } catch (e) {
-            res.writeHead(400);
-            res.end(JSON.stringify({ ok: false, error: (e as Error).message }));
-          }
-        });
+        try {
+          const data = await this.readJsonBody(req);
+          this.handlers.onUpdateConfig(data);
+          this.flushBroadcast();
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, state: this.handlers.getState() }));
+        } catch (e) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: (e as Error).message }));
+        }
         return;
       }
 
       if (req.method === 'POST' && url.pathname === '/api/switch') {
-        let body = '';
-        req.on('data', (c) => (body += c));
-        req.on('end', () => {
-          try {
-            const data = JSON.parse(body || '{}');
-            this.handlers.onForceSwitch(Boolean(data.remote), data.clientId);
-            this.broadcast();
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ ok: true }));
-          } catch {
-            res.writeHead(400);
-            res.end();
-          }
-        });
+        try {
+          const data = await this.readJsonBody(req);
+          this.handlers.onForceSwitch(Boolean(data.remote), data.clientId);
+          this.flushBroadcast();
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true }));
+        } catch {
+          res.writeHead(400);
+          res.end();
+        }
         return;
       }
 
       if (req.method === 'POST' && url.pathname === '/api/center') {
         this.handlers.onCenterCursor();
-        this.broadcast();
+        this.flushBroadcast();
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true }));
         return;
@@ -110,6 +126,8 @@ export class WebDashboard {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       res.end(HTML_PAGE);
     });
+
+    this.server = server;
 
     server.on('error', (err) => {
       console.error(`[Dashboard] Erro ao iniciar porta ${this.port}:`, err.message);
@@ -120,11 +138,46 @@ export class WebDashboard {
     });
   }
 
-  broadcast(): void {
+  private flushBroadcast(): void {
+    if (this.broadcastTimer) {
+      clearTimeout(this.broadcastTimer);
+      this.broadcastTimer = null;
+    }
+    this.lastBroadcastMs = Date.now();
     if (this.sseClients.size === 0) return;
     const payload = `data: ${JSON.stringify(this.handlers.getState())}\n\n`;
     for (const client of this.sseClients) {
       client.write(payload);
+    }
+  }
+
+  broadcast(): void {
+    if (this.sseClients.size === 0) return;
+    const elapsed = Date.now() - this.lastBroadcastMs;
+    if (elapsed >= 30) {
+      this.flushBroadcast();
+    } else if (!this.broadcastTimer) {
+      this.broadcastTimer = setTimeout(() => this.flushBroadcast(), 30 - elapsed);
+      this.broadcastTimer.unref?.();
+    }
+  }
+
+  stop(): void {
+    if (this.broadcastTimer) {
+      clearTimeout(this.broadcastTimer);
+      this.broadcastTimer = null;
+    }
+    for (const client of this.sseClients) {
+      try {
+        client.end();
+      } catch {}
+    }
+    this.sseClients.clear();
+    if (this.server) {
+      try {
+        this.server.close();
+      } catch {}
+      this.server = null;
     }
   }
 }
@@ -460,6 +513,18 @@ const HTML_PAGE = `<!DOCTYPE html>
       return best;
     }
 
+    function escapeHtml(s) {
+      return String(s ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
+    let lastClientsTopologyKey = '';
+    let lastEventsKey = '';
+
     function render(state) {
       currentState = state;
       layoutStage();
@@ -494,91 +559,130 @@ const HTML_PAGE = `<!DOCTYPE html>
         dotServer.style.display = 'none';
       }
 
-      // Renderiza clientes no palco
       const pos = getPositions();
-      clientsContainer.innerHTML = '';
+      const topologyKey = state.clients.map(cl => [cl.id, cl.name, cl.edge, cl.active, cl.screen.width, cl.screen.height].join(':')).join('|');
 
-      state.clients.forEach((client, idx) => {
-        const mon = document.createElement('div');
-        mon.className = 'monitor client-tile' + (client.active ? ' active-screen' : '');
-        mon.id = 'mon-' + client.id;
-        
-        let p = pos[client.edge] || pos.right;
-        mon.style.left = p.x + 'px';
-        mon.style.top = p.y + 'px';
+      // Só reconstrói o DOM dos clientes quando a lista/topologia muda (e não durante arrasto),
+      // evitando destruir elementos durante cliques ou drag-and-drop!
+      if (topologyKey !== lastClientsTopologyKey && !draggingClientId) {
+        lastClientsTopologyKey = topologyKey;
+        clientsContainer.innerHTML = '';
 
-        mon.innerHTML = \`
-          <div class="num">\${idx + 2}</div>
-          <div class="title" title="\${client.name}">\${client.name}</div>
-          <div class="res">\${client.screen.width}x\${client.screen.height} [\${client.edge.toUpperCase()}]</div>
-          <div class="ping-pill">\${client.rttMs}ms</div>
-          <div class="cursor-dot" id="dot-\${client.id}" style="display:none"></div>
-        \`;
+        state.clients.forEach((client, idx) => {
+          const mon = document.createElement('div');
+          mon.className = 'monitor client-tile' + (client.active ? ' active-screen' : '');
+          mon.dataset.clientId = client.id;
 
-        // Cursor do cliente
-        if (c.screen === client.id) {
-          const dot = mon.querySelector('#dot-' + client.id);
-          if (dot) {
+          const p = pos[client.edge] || pos.right;
+          mon.style.left = p.x + 'px';
+          mon.style.top = p.y + 'px';
+
+          mon.innerHTML = \`
+            <div class="num">\${idx + 2}</div>
+            <div class="title" title="\${escapeHtml(client.name)}">\${escapeHtml(client.name)}</div>
+            <div class="res">\${client.screen.width}x\${client.screen.height} [\${escapeHtml(client.edge.toUpperCase())}]</div>
+            <div class="ping-pill" data-ping-for="\${escapeHtml(client.id)}">\${client.rttMs}ms</div>
+            <div class="cursor-dot" data-dot-for="\${escapeHtml(client.id)}" style="display:none"></div>
+          \`;
+
+          // Drag and Drop
+          mon.addEventListener('pointerdown', (e) => {
+            draggingClientId = client.id;
+            mon.setPointerCapture(e.pointerId);
+            const rect = mon.getBoundingClientRect();
+            dragOffsetX = e.clientX - rect.left;
+            dragOffsetY = e.clientY - rect.top;
+          });
+
+          mon.addEventListener('pointermove', (e) => {
+            if (draggingClientId !== client.id) return;
+            const stageRect = stage.getBoundingClientRect();
+            const x = e.clientX - stageRect.left - dragOffsetX;
+            const y = e.clientY - stageRect.top - dragOffsetY;
+            mon.style.left = x + 'px';
+            mon.style.top = y + 'px';
+
+            const nearest = findNearestEdge(x, y);
+            for (const side of ['right', 'left', 'top', 'bottom']) {
+              document.getElementById('zone-' + side).classList.toggle('highlight', side === nearest);
+            }
+          });
+
+          mon.addEventListener('pointerup', (e) => {
+            if (draggingClientId !== client.id) return;
+            draggingClientId = null;
+            mon.releasePointerCapture(e.pointerId);
+            for (const side of ['right', 'left', 'top', 'bottom']) {
+              document.getElementById('zone-' + side).classList.remove('highlight');
+            }
+            const x = parseFloat(mon.style.left);
+            const y = parseFloat(mon.style.top);
+            const nearest = findNearestEdge(x, y);
+            lastClientsTopologyKey = '';
+            setClientEdge(client.id, nearest);
+          });
+
+          clientsContainer.appendChild(mon);
+        });
+
+        // Renderiza lista lateral de clientes
+        if (state.clients.length === 0) {
+          clientList.innerHTML = '<div style="font-size: 0.8rem; color: var(--muted); padding: 8px 0;">Nenhum cliente conectado no momento.</div>';
+        } else {
+          clientList.innerHTML = '';
+          state.clients.forEach((client) => {
+            const row = document.createElement('div');
+            row.className = 'client-row';
+            row.innerHTML = \`
+              <div class="client-row-info">
+                <div class="client-row-name">\${escapeHtml(client.name)}</div>
+                <div class="client-row-sub" data-sub-for="\${escapeHtml(client.id)}">\${escapeHtml(client.address)} • Borda: <strong>\${escapeHtml(client.edge.toUpperCase())}</strong> • \${client.rttMs}ms</div>
+              </div>
+            \`;
+            const btn = document.createElement('button');
+            btn.textContent = client.active ? 'Devolver' : 'Assumir';
+            btn.addEventListener('click', () => testSwitch(client.id));
+            row.appendChild(btn);
+            clientList.appendChild(row);
+          });
+        }
+      }
+
+      // Atualiza in-place posição de cursor, ping e coordenadas (sem recriar DOM)
+      state.clients.forEach((client) => {
+        const mon = clientsContainer.querySelector(\`[data-client-id="\${CSS.escape(client.id)}"]\`);
+        if (mon && draggingClientId !== client.id) {
+          const p = pos[client.edge] || pos.right;
+          mon.style.left = p.x + 'px';
+          mon.style.top = p.y + 'px';
+        }
+        const pingEl = clientsContainer.querySelector(\`[data-ping-for="\${CSS.escape(client.id)}"]\`);
+        if (pingEl) pingEl.textContent = client.rttMs + 'ms';
+
+        const subEl = clientList.querySelector(\`[data-sub-for="\${CSS.escape(client.id)}"]\`);
+        if (subEl) {
+          subEl.innerHTML = \`\${escapeHtml(client.address)} • Borda: <strong>\${escapeHtml(client.edge.toUpperCase())}</strong> • \${client.rttMs}ms\`;
+        }
+
+        const dot = clientsContainer.querySelector(\`[data-dot-for="\${CSS.escape(client.id)}"]\`);
+        if (dot) {
+          if (c.screen === client.id) {
             dot.style.display = 'block';
             dot.style.left = ((c.x / Math.max(1, client.screen.width)) * 100) + '%';
             dot.style.top = ((c.y / Math.max(1, client.screen.height)) * 100) + '%';
+          } else {
+            dot.style.display = 'none';
           }
         }
-
-        // Drag and Drop
-        mon.addEventListener('pointerdown', (e) => {
-          draggingClientId = client.id;
-          mon.setPointerCapture(e.pointerId);
-          const rect = mon.getBoundingClientRect();
-          dragOffsetX = e.clientX - rect.left;
-          dragOffsetY = e.clientY - rect.top;
-        });
-
-        mon.addEventListener('pointermove', (e) => {
-          if (draggingClientId !== client.id) return;
-          const stageRect = stage.getBoundingClientRect();
-          const x = e.clientX - stageRect.left - dragOffsetX;
-          const y = e.clientY - stageRect.top - dragOffsetY;
-          mon.style.left = x + 'px';
-          mon.style.top = y + 'px';
-
-          const nearest = findNearestEdge(x, y);
-          for (const side of ['right', 'left', 'top', 'bottom']) {
-            document.getElementById('zone-' + side).classList.toggle('highlight', side === nearest);
-          }
-        });
-
-        mon.addEventListener('pointerup', (e) => {
-          if (draggingClientId !== client.id) return;
-          draggingClientId = null;
-          mon.releasePointerCapture(e.pointerId);
-          const x = parseFloat(mon.style.left);
-          const y = parseFloat(mon.style.top);
-          const nearest = findNearestEdge(x, y);
-          setClientEdge(client.id, nearest);
-        });
-
-        clientsContainer.appendChild(mon);
       });
 
-      // Renderiza lista lateral de clientes
-      if (state.clients.length === 0) {
-        clientList.innerHTML = '<div style="font-size: 0.8rem; color: var(--muted); padding: 8px 0;">Nenhum cliente conectado no momento.</div>';
-      } else {
-        clientList.innerHTML = state.clients.map((client) => \`
-          <div class="client-row">
-            <div class="client-row-info">
-              <div class="client-row-name">\${client.name}</div>
-              <div class="client-row-sub">\${client.address} • Borda: <strong>\${client.edge.toUpperCase()}</strong> • \${client.rttMs}ms</div>
-            </div>
-            <button onclick="testSwitch('\${client.id}')">\${client.active ? 'Devolver' : 'Assumir'}</button>
-          </div>
-        \`).join('');
-      }
-
-      // Atualiza log de eventos
+      // Atualiza log de eventos apenas quando houver mudança
       if (state.events && state.events.length > 0) {
-        eventsLog.innerHTML = state.events.slice(0, 15).map(ev => \`<div>\${ev}</div>\`).join('');
+        const eventsKey = state.events[0] + ':' + state.events.length;
+        if (eventsKey !== lastEventsKey) {
+          lastEventsKey = eventsKey;
+          eventsLog.innerHTML = state.events.slice(0, 15).map(ev => \`<div>\${escapeHtml(ev)}</div>\`).join('');
+        }
       }
     }
 

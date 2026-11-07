@@ -57,107 +57,132 @@ class LinuxCapture extends EventEmitter implements Capture {
     const config = JSON.stringify({ width, height, ...this.options });
 
     return await new Promise<{ width: number; height: number }>((resolve, reject) => {
-      const proc = spawn('python3', [this.script, config], { stdio: ['pipe', 'pipe', 'inherit'] });
+      const proc = spawn('python3', [this.script, config], { stdio: ['pipe', 'pipe', 'pipe'] });
       this.proc = proc;
       let ready = false;
+      let stderrOutput = '';
 
-      const reader = new LineReader((line) => {
-        let msg: any;
-        try {
-          msg = JSON.parse(line);
-        } catch {
-          return;
-        }
-        switch (msg.type) {
-          case 'ready':
-            ready = true;
-            console.log(`[Captura] Tela ${msg.width}x${msg.height}`);
-            console.log(`[Captura] Mouses: ${msg.mice.join(', ')}`);
-            console.log(`[Captura] Teclados: ${msg.keyboards.join(', ')}`);
-            resolve({ width: Number(msg.width), height: Number(msg.height) });
-            break;
-          case 'edge':
-            this.emit('edge', {
-              edge: (msg.edge as Edge) || this.options.edge,
-              yRatio: Number(msg.yRatio ?? 0.5),
-            });
-            break;
-          case 'client_return':
-            this.emit('client_return', Number(msg.yRatio));
-            break;
-          case 'pos':
-            this.emit('pos', { x: Number(msg.x), y: Number(msg.y) });
-            break;
-          case 'clipboard':
-            this.emit('clipboard', {
-              text: msg.text,
-              image: msg.image,
-              format: msg.format || (msg.image ? 'image' : 'text'),
-            });
-            break;
-          case 'emergency':
-            this.emit('emergency');
-            break;
-          case 'move':
-          case 'button':
-          case 'wheel':
-          case 'key':
-            this.emit('input', msg as InputPacket);
-            break;
-        }
+      proc.stderr?.on('data', (chunk) => {
+        const text = chunk.toString('utf8');
+        stderrOutput += text;
+        process.stderr.write(text);
       });
 
-      proc.stdout!.on('data', (chunk) => reader.push(chunk));
+      const reader = new LineReader(
+        (line) => {
+          let msg: any;
+          try {
+            msg = JSON.parse(line);
+          } catch {
+            return;
+          }
+          switch (msg.type) {
+            case 'ready':
+              ready = true;
+              console.log(`[Captura] Tela ${msg.width}x${msg.height}`);
+              console.log(`[Captura] Mouses: ${msg.mice.join(', ')}`);
+              console.log(`[Captura] Teclados: ${msg.keyboards.join(', ')}`);
+              resolve({ width: Number(msg.width), height: Number(msg.height) });
+              break;
+            case 'edge':
+              this.emit('edge', {
+                edge: (msg.edge as Edge) || this.options.edge,
+                yRatio: Number(msg.yRatio ?? 0.5),
+              });
+              break;
+            case 'client_return':
+              this.emit('client_return', Number(msg.yRatio));
+              break;
+            case 'pos':
+              this.emit('pos', { x: Number(msg.x), y: Number(msg.y) });
+              break;
+            case 'clipboard':
+              this.emit('clipboard', {
+                text: msg.text,
+                image: msg.image,
+                format: msg.format || (msg.image ? 'image' : 'text'),
+              });
+              break;
+            case 'emergency':
+              this.emit('emergency');
+              break;
+            case 'move':
+            case 'button':
+            case 'wheel':
+            case 'key':
+              this.emit('input', msg as InputPacket);
+              break;
+          }
+        },
+        { maxLineLength: 10 * 1024 * 1024 }
+      );
+
+      proc.stdout!.on('data', (chunk) => {
+        try {
+          reader.push(chunk);
+        } catch (err) {
+          console.warn('[Captura] Aviso no LineReader:', (err as Error).message);
+        }
+      });
       proc.on('error', (err) => {
         if (!ready) reject(err);
       });
       proc.on('exit', (code) => {
         this.proc = null;
-        if (!ready) reject(new Error(`linux_capture.py encerrou com código ${code}`));
-        else this.emit('exit', code);
+        if (!ready) {
+          const errMsg = stderrOutput.trim() || `linux_capture.py encerrou com código ${code}`;
+          reject(new Error(errMsg));
+        } else {
+          this.emit('exit', code);
+        }
       });
     });
   }
 
+  private sendCmd(payload: Record<string, unknown>): void {
+    const stdin = this.proc?.stdin;
+    if (stdin && !stdin.destroyed && stdin.writable) {
+      stdin.write(JSON.stringify(payload) + '\n');
+    }
+  }
+
   setRemote(on: boolean, yRatio?: number, edge?: Edge): void {
-    this.proc?.stdin?.write(JSON.stringify({ cmd: 'remote', on, yRatio, edge }) + '\n');
+    this.sendCmd({ cmd: 'remote', on, yRatio, edge });
   }
 
   clientEnter(yRatio: number, edge?: Edge): void {
-    this.proc?.stdin?.write(JSON.stringify({ cmd: 'client_enter', yRatio, edge }) + '\n');
+    this.sendCmd({ cmd: 'client_enter', yRatio, edge });
   }
 
   clientLeave(): void {
-    this.proc?.stdin?.write(JSON.stringify({ cmd: 'client_leave' }) + '\n');
+    this.sendCmd({ cmd: 'client_leave' });
   }
 
   injectFromClient(packet: InputPacket): void {
     if (packet.type === 'move') {
-      this.proc?.stdin?.write(JSON.stringify({ cmd: 'inject_move', dx: packet.dx, dy: packet.dy }) + '\n');
+      this.sendCmd({ cmd: 'inject_move', dx: packet.dx, dy: packet.dy });
     } else if (packet.type === 'button') {
-      this.proc?.stdin?.write(
-        JSON.stringify({ cmd: 'inject_button', button: packet.button, down: packet.down }) + '\n'
-      );
+      this.sendCmd({ cmd: 'inject_button', button: packet.button, down: packet.down });
     } else if (packet.type === 'wheel') {
-      this.proc?.stdin?.write(JSON.stringify({ cmd: 'inject_wheel', dy: packet.dy, dx: packet.dx }) + '\n');
+      this.sendCmd({ cmd: 'inject_wheel', dy: packet.dy, dx: packet.dx });
     } else if (packet.type === 'key') {
-      this.proc?.stdin?.write(JSON.stringify({ cmd: 'inject_key', code: packet.code, down: packet.down }) + '\n');
+      this.sendCmd({ cmd: 'inject_key', code: packet.code, down: packet.down });
     }
   }
 
   setClipboard(data: ClipboardData | string): void {
     if (!data) return;
     const payload = typeof data === 'string' ? { text: data } : data;
-    this.proc?.stdin?.write(JSON.stringify({ cmd: 'clipboard', ...payload }) + '\n');
+    this.sendCmd({ cmd: 'clipboard', ...payload });
   }
 
   updateConfig(cfg: Partial<CaptureOptions>): void {
     this.options = { ...this.options, ...cfg };
-    this.proc?.stdin?.write(JSON.stringify({ cmd: 'config', ...cfg }) + '\n');
+    this.sendCmd({ cmd: 'config', ...cfg });
   }
 
   centerCursor(): void {
-    this.proc?.stdin?.write(JSON.stringify({ cmd: 'center' }) + '\n');
+    this.sendCmd({ cmd: 'center' });
   }
 
   stop(): void {
@@ -182,6 +207,7 @@ function uiohookToEvdev(code: number): number | undefined {
 class GenericCapture extends EventEmitter implements Capture {
   private remote = false;
   private warping = false;
+  private cooldownUntil = 0;
   private width = 1920;
   private height = 1080;
   private hook: any;
@@ -241,20 +267,21 @@ class GenericCapture extends EventEmitter implements Capture {
     const cy = Math.floor(this.height / 2);
     if (!this.remote) {
       this.emit('pos', { x, y });
+      if (Date.now() < this.cooldownUntil) return;
       let hitEdge: Edge | null = null;
       let ratio = 0.5;
       if (x >= this.width - 1) {
         hitEdge = 'right';
-        ratio = y / (this.height - 1);
+        ratio = y / Math.max(1, this.height - 1);
       } else if (x <= 0) {
         hitEdge = 'left';
-        ratio = y / (this.height - 1);
+        ratio = y / Math.max(1, this.height - 1);
       } else if (y <= 0) {
         hitEdge = 'top';
-        ratio = x / (this.width - 1);
+        ratio = x / Math.max(1, this.width - 1);
       } else if (y >= this.height - 1) {
         hitEdge = 'bottom';
-        ratio = x / (this.width - 1);
+        ratio = x / Math.max(1, this.width - 1);
       }
       if (hitEdge) {
         this.emit('edge', { edge: hitEdge, yRatio: ratio });
@@ -273,6 +300,7 @@ class GenericCapture extends EventEmitter implements Capture {
     if (on) {
       void this.warp(Math.floor(this.width / 2), Math.floor(this.height / 2));
     } else {
+      this.cooldownUntil = Date.now() + 350;
       const e = edge || this.options.edge;
       const x = e === 'right' ? this.width - 40 : e === 'left' ? 40 : Math.round(yRatio * (this.width - 1));
       const y = e === 'bottom' ? this.height - 40 : e === 'top' ? 40 : Math.round(yRatio * (this.height - 1));

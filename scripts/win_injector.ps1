@@ -1,4 +1,4 @@
-<#
+﻿<#
   Injetor e Capturador Bidirecional de mouse/teclado + Clipboard do CLIENTE KVM no Windows 11/10.
 
   Comandos via stdin (Servidor -> Cliente):
@@ -155,6 +155,8 @@ public static class KvmInjector
     private static bool hasLastPhys;
     private static long cooldownUntilTick;
     private static long lastPosTick;
+    private static long lastBoundsRefreshTick;
+    private static readonly Stopwatch clock = Stopwatch.StartNew();
     private static string lastClipboard = "";
     private static uint lastClipSeq = 0;
     private static IntPtr clipHwnd = IntPtr.Zero;
@@ -324,9 +326,14 @@ public static class KvmInjector
                         lastPhysY = ms.pt.Y;
                         hasLastPhys = true;
 
-                        if (Environment.TickCount - cooldownUntilTick >= 0)
+                        long now = clock.ElapsedMilliseconds;
+                        if (now >= cooldownUntilTick)
                         {
-                            RefreshBounds();
+                            if (now - lastBoundsRefreshTick >= 2000)
+                            {
+                                RefreshBounds();
+                                lastBoundsRefreshTick = now;
+                            }
                             bool hit = false;
                             double ratio = 0.5;
                             if (returnEdge == "left" && ms.pt.X <= vx + 1 && dx < 0)
@@ -353,8 +360,8 @@ public static class KvmInjector
                             if (hit)
                             {
                                 capturingServer = true;
-                                cooldownUntilTick = Environment.TickCount + 300;
-                                CheckAndSendClipboard();
+                                cooldownUntilTick = now + 300;
+                                ThreadPool.QueueUserWorkItem(_ => CheckAndSendClipboard());
                                 WriteOut("cs_e " + ratio.ToString("0.0000", CultureInfo.InvariantCulture));
                                 return (IntPtr)1;
                             }
@@ -430,7 +437,7 @@ public static class KvmInjector
                     if (down)
                     {
                         capturingServer = false;
-                        cooldownUntilTick = Environment.TickCount + 300;
+                        cooldownUntilTick = clock.ElapsedMilliseconds + 300;
                         WriteOut("cs_l");
                     }
                     return (IntPtr)1;
@@ -527,7 +534,7 @@ public static class KvmInjector
         curY = Math.Max(vy, Math.Min(vy + vh - 1, curY));
         lastPhysX = curX;
         lastPhysY = curY;
-        cooldownUntilTick = Environment.TickCount + 300;
+        cooldownUntilTick = clock.ElapsedMilliseconds + 300;
         MoveCursorAbsolute(curX, curY);
         WriteOut("p " + (curX - vx) + " " + (curY - vy));
     }
@@ -552,9 +559,9 @@ public static class KvmInjector
 
         int nx = curX + dx;
         int ny = curY + dy;
-        long now = Environment.TickCount;
+        long now = clock.ElapsedMilliseconds;
 
-        if (now - cooldownUntilTick >= 0)
+        if (now >= cooldownUntilTick)
         {
             bool hit = false;
             double ratio = 0.5;
@@ -582,10 +589,10 @@ public static class KvmInjector
             if (hit)
             {
                 PlaceAtReturnEdge(ratio);
-                cooldownUntilTick = Environment.TickCount + 500;
+                cooldownUntilTick = clock.ElapsedMilliseconds + 500;
                 active = false;
                 ReleaseAll();
-                CheckAndSendClipboard();
+                ThreadPool.QueueUserWorkItem(_ => CheckAndSendClipboard());
                 WriteOut("r " + ratio.ToString("0.0000", CultureInfo.InvariantCulture));
                 return;
             }

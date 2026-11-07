@@ -88,9 +88,10 @@ if [ ! -f /etc/modules-load.d/uinput.conf ]; then
   echo "[+] Configurado carregamento automático do uinput em /etc/modules-load.d/uinput.conf."
 fi
 
-# Configura regra udev para uinput
+# Configura regra udev para uinput e dispositivos de entrada
 cat << 'EOF' > /etc/udev/rules.d/99-mult-system-kvm.rules
 KERNEL=="uinput", MODE="0660", GROUP="input", OPTIONS+="static_node=uinput"
+SUBSYSTEM=="input", KERNEL=="event*", MODE="0660", GROUP="input"
 EOF
 udevadm control --reload-rules || true
 udevadm trigger || true
@@ -101,10 +102,14 @@ if getent group input >/dev/null; then
   echo "[+] Usuário '$CURRENT_USER' adicionado ao grupo 'input'."
 fi
 
-# Permissão Imediata via ACL no /dev/uinput
+# Permissão Imediata via ACL no /dev/uinput e dispositivos /dev/input/event*
 if [ -e /dev/uinput ]; then
   setfacl -m "u:$CURRENT_USER:rw" /dev/uinput || true
   echo "[+] Permissão ACL de leitura/escrita concedida em /dev/uinput para $CURRENT_USER."
+fi
+if compgen -G "/dev/input/event*" > /dev/null; then
+  setfacl -m "u:$CURRENT_USER:rw" /dev/input/event* || true
+  echo "[+] Permissão ACL de leitura/escrita concedida em /dev/input/event* para $CURRENT_USER."
 fi
 
 echo ""

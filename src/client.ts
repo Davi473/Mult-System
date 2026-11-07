@@ -39,6 +39,10 @@ const HOSTS = Array.from(
 class KVMClient {
   private socket: net.Socket | null = null;
   private active = false;
+  private controllingServer = false;
+  private authenticated = false;
+  private stopped = false;
+  private reconnectTimer: NodeJS.Timeout | null = null;
   private hostIndex = 0;
   private reconnectAttempts = 0;
   private mouseBatcher: MouseBatcher;
@@ -54,6 +58,7 @@ class KVMClient {
     injector.on('return', (yRatio: number) => {
       if (!this.active) return;
       this.active = false;
+      this.mouseBatcher.cancel();
       console.log('[Cliente] Borda de retorno atingida -> devolvendo controle ao Servidor.');
       this.send({ type: 'return', yRatio });
     });
@@ -65,6 +70,7 @@ class KVMClient {
     });
 
     injector.on('clipboard', (data: { format?: string; text?: string; image?: string }) => {
+      if (!this.authenticated) return;
       this.send({
         type: 'clipboard',
         format: data.format as 'text' | 'image',
@@ -75,17 +81,26 @@ class KVMClient {
     });
 
     injector.on('client_enter', (yRatio: number) => {
+      if (!this.authenticated || !this.socket || this.socket.destroyed) {
+        // Se não estiver conectado/autenticado ao servidor, libera imediatamente o hook local!
+        this.injector.leave();
+        return;
+      }
       this.active = false;
+      this.controllingServer = true;
       console.log('[Cliente] Borda atingida -> Mouse/Teclado do Cliente agora controlando o Servidor Linux!');
       this.send({ type: 'client_enter', yRatio });
     });
 
     injector.on('client_leave', () => {
+      this.controllingServer = false;
+      this.mouseBatcher.cancel();
       console.log('[Cliente] ScrollLock -> Controle voltou para o Cliente.');
       this.send({ type: 'client_leave' });
     });
 
     injector.on('client_input', (pkt: InputPacket) => {
+      if (!this.controllingServer || !this.authenticated) return;
       if (pkt.type === 'move') {
         this.mouseBatcher.push(pkt.dx, pkt.dy);
       } else {
@@ -95,8 +110,10 @@ class KVMClient {
     });
 
     injector.on('exit', (code: number) => {
-      console.error(`[Cliente] Injetor encerrou (código ${code}). Saindo.`);
-      process.exit(1);
+      if (!this.stopped) {
+        console.error(`[Cliente] Injetor encerrou (código ${code}). Saindo.`);
+        process.exit(1);
+      }
     });
   }
 
@@ -106,7 +123,26 @@ class KVMClient {
     }
   }
 
+  stop() {
+    this.stopped = true;
+    this.mouseBatcher.cancel();
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    if (this.active || this.controllingServer) {
+      this.active = false;
+      this.controllingServer = false;
+      this.injector.leave();
+    }
+    if (this.socket && !this.socket.destroyed) {
+      this.socket.destroy();
+      this.socket = null;
+    }
+  }
+
   async connect() {
+    if (this.stopped) return;
     let host = HOSTS[this.hostIndex % HOSTS.length];
     let port = SERVER_PORT;
 
@@ -119,11 +155,17 @@ class KVMClient {
           console.log(`[Cliente] Servidor descoberto automaticamente em: ${discovered.host}:${discovered.port} (${discovered.name})`);
           host = discovered.host;
           port = discovered.port;
+          if (!HOSTS.includes(discovered.host)) {
+            HOSTS.unshift(discovered.host);
+            this.hostIndex = 0;
+          }
         }
       } catch {
         // Fallback silencioso para lista estática
       }
     }
+
+    if (this.stopped) return;
 
     let connected = false;
     const useTLS = isTLSEnabled();
@@ -132,7 +174,8 @@ class KVMClient {
     const onConnect = () => {
       connected = true;
       this.reconnectAttempts = 0;
-      socket.setTimeout(0);
+      // Timeout de inatividade (10s - o servidor envia ping a cada 2s)
+      socket.setTimeout(10000);
       socket.setNoDelay(true);
       socket.setKeepAlive(true, 2000);
       this.socket = socket;
@@ -154,7 +197,7 @@ class KVMClient {
 
     socket.setTimeout(4000);
     socket.on('timeout', () => {
-      if (!connected) socket.destroy(new Error('tempo esgotado de conexão'));
+      socket.destroy(new Error(connected ? 'inatividade de conexão com o servidor' : 'tempo esgotado de conexão'));
     });
 
     const reader = new FrameReader(
@@ -181,10 +224,14 @@ class KVMClient {
 
     socket.on('close', () => {
       if (this.socket === socket) this.socket = null;
-      if (this.active) {
+      this.authenticated = false;
+      this.mouseBatcher.cancel();
+      if (this.active || this.controllingServer) {
         this.active = false;
+        this.controllingServer = false;
         this.injector.leave();
       }
+      if (this.stopped) return;
       if (!connected) {
         this.hostIndex++;
       }
@@ -196,7 +243,7 @@ class KVMClient {
       const delay = Math.round(baseDelay + jitter);
 
       console.log(`[Cliente] Desconectado. Nova tentativa em ${(delay / 1000).toFixed(1)}s (tentativa #${this.reconnectAttempts})...`);
-      setTimeout(() => this.connect(), delay);
+      this.reconnectTimer = setTimeout(() => this.connect(), delay);
     });
   }
 
@@ -214,9 +261,18 @@ class KVMClient {
         break;
       }
       case 'auth_success':
+        this.authenticated = true;
         console.log(`[Cliente] Autenticado com sucesso no Servidor! (ID: ${packet.clientId})`);
+        this.send({
+          type: 'client_info',
+          name: CLIENT_NAME,
+          id: CLIENT_ID,
+          width: this.injector.screenWidth,
+          height: this.injector.screenHeight,
+        });
         break;
       case 'auth_fail':
+        this.authenticated = false;
         console.error(`[Cliente] Falha de autenticação: ${packet.reason}. Verifique a KVM_SECRET_KEY no .env.`);
         break;
       case 'ping':
@@ -236,18 +292,24 @@ class KVMClient {
         if (packet.returnEdge) {
           this.injector.setReturnEdge(packet.returnEdge);
         }
+        this.controllingServer = false;
+        this.mouseBatcher.cancel();
         this.active = true;
         this.injector.enter(packet.yRatio);
         console.log('[Cliente] Controle recebido do Servidor.');
         break;
       case 'client_return':
         this.active = false;
+        this.controllingServer = false;
+        this.mouseBatcher.cancel();
         this.injector.clientReturned(packet.yRatio);
-        console.log('[Cliente] Cursor retornou do Servidor Linux para o Cliente Windows.');
+        console.log('[Cliente] Cursor retornou do Servidor Linux para o Cliente.');
         break;
       case 'leave':
-        if (this.active) {
+        if (this.active || this.controllingServer) {
           this.active = false;
+          this.controllingServer = false;
+          this.mouseBatcher.cancel();
           this.injector.leave();
           console.log('[Cliente] Controle devolvido ao Servidor.');
         }
@@ -271,9 +333,11 @@ class KVMClient {
 async function main() {
   const injector = createInjector(RETURN_EDGE);
   await injector.start();
-  new KVMClient(injector).connect();
+  const client = new KVMClient(injector);
+  void client.connect();
 
   const shutdown = () => {
+    client.stop();
     injector.stop();
     process.exit(0);
   };

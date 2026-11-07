@@ -26,6 +26,7 @@ const USE_TLS = isTLSEnabled();
 
 interface ConnectedClientSession {
   id: string;
+  pendingId?: string;
   socket: net.Socket;
   name: string;
   address: string;
@@ -94,9 +95,10 @@ async function main() {
   };
 
   const broadcastPacket = (packet: Packet, exceptSocket?: net.Socket) => {
+    const encoded = encodeBinary(packet);
     for (const c of clients.values()) {
       if (c.authenticated && c.socket && !c.socket.destroyed && c.socket !== exceptSocket) {
-        c.socket.write(encodeBinary(packet));
+        c.socket.write(encoded);
       }
     }
   };
@@ -177,12 +179,19 @@ async function main() {
       if (toRemote) {
         let client = targetClientId ? clients.get(targetClientId) : null;
         if (!client) client = Array.from(clients.values()).find((c) => c.authenticated) || null;
-        if (client) {
+        if (client && client.authenticated) {
+          if (activeClientId && activeClientId !== client.id) {
+            const prev = getActiveClient();
+            if (prev) {
+              prev.batcher.cancel();
+              sendToClient(prev, { type: 'leave' });
+            }
+          }
           activeClientId = client.id;
           capture.setRemote(true, 0.5, client.edge);
           const returnEdge = oppositeEdge(client.edge);
           sendToClient(client, { type: 'enter', yRatio: 0.5, returnEdge });
-          cursor = { screen: client.id, x: client.screenWidth / 2, y: client.screenHeight / 2 };
+          cursor = { screen: client.id, x: Math.round(client.screenWidth / 2), y: Math.round(client.screenHeight / 2) };
           addEvent(`Controle alternado manualmente para: ${client.name}`);
           console.log(`[Servidor] Alternância manual pelo painel -> "${client.name}" ativo.`);
           dashboard.broadcast();
@@ -190,11 +199,12 @@ async function main() {
       } else if (activeClientId) {
         const prev = getActiveClient();
         if (prev) {
+          prev.batcher.cancel();
           sendToClient(prev, { type: 'leave' });
         }
         activeClientId = null;
         capture.setRemote(false, 0.5);
-        cursor = { screen: 'server', x: serverScreen.width / 2, y: serverScreen.height / 2 };
+        cursor = { screen: 'server', x: Math.round(serverScreen.width / 2), y: Math.round(serverScreen.height / 2) };
         addEvent('Controle de volta no Servidor Linux.');
         dashboard.broadcast();
       }
@@ -202,12 +212,15 @@ async function main() {
     onCenterCursor: () => {
       if (activeClientId) {
         const prev = getActiveClient();
-        if (prev) sendToClient(prev, { type: 'leave' });
+        if (prev) {
+          prev.batcher.cancel();
+          sendToClient(prev, { type: 'leave' });
+        }
         activeClientId = null;
         capture.setRemote(false, 0.5);
       }
       capture.centerCursor();
-      cursor = { screen: 'server', x: serverScreen.width / 2, y: serverScreen.height / 2 };
+      cursor = { screen: 'server', x: Math.round(serverScreen.width / 2), y: Math.round(serverScreen.height / 2) };
       addEvent('Cursor centralizado e recalibrado no Linux.');
       dashboard.broadcast();
     },
@@ -216,6 +229,9 @@ async function main() {
   const backToServer = (yRatio: number, reason: string, fromEdge?: Edge) => {
     if (!activeClientId) return;
     const client = getActiveClient();
+    if (client) {
+      client.batcher.cancel();
+    }
     activeClientId = null;
     const edge = fromEdge || client?.edge || defaultClientEdge;
     capture.setRemote(false, yRatio, edge);
@@ -244,20 +260,17 @@ async function main() {
       }
     }
 
-    if (!targetClient) {
-      // Fallback para único cliente conectado se só houver 1
-      if (clients.size === 1) {
-        const only = Array.from(clients.values())[0];
-        if (only.authenticated && only.edge === edge) targetClient = only;
-      }
-    }
-
     if (targetClient) {
       controllingClientId = null;
       activeClientId = targetClient.id;
       capture.setRemote(true, yRatio, edge);
       const returnEdge = oppositeEdge(edge);
       sendToClient(targetClient, { type: 'enter', yRatio, returnEdge });
+      cursor = {
+        screen: targetClient.id,
+        x: returnEdge === 'left' ? 40 : returnEdge === 'right' ? targetClient.screenWidth - 40 : Math.round(yRatio * targetClient.screenWidth),
+        y: returnEdge === 'top' ? 40 : returnEdge === 'bottom' ? targetClient.screenHeight - 40 : Math.round(yRatio * targetClient.screenHeight),
+      };
       addEvent(`Borda [${edge.toUpperCase()}] atingida -> Controlando "${targetClient.name}"`);
       console.log(`[Servidor] Borda (${edge}) atingida -> Mouse controlando "${targetClient.name}".`);
       dashboard.broadcast();
@@ -307,9 +320,12 @@ async function main() {
   capture.on('emergency', () => {
     if (!activeClientId) return;
     const active = getActiveClient();
-    if (active) sendToClient(active, { type: 'leave' });
+    if (active) {
+      active.batcher.cancel();
+      sendToClient(active, { type: 'leave' });
+    }
     activeClientId = null;
-    cursor = { screen: 'server', x: serverScreen.width / 2, y: serverScreen.height / 2 };
+    cursor = { screen: 'server', x: Math.round(serverScreen.width / 2), y: Math.round(serverScreen.height / 2) };
     addEvent('ScrollLock acionado: Controle devolvido de emergência para o Linux.');
     dashboard.broadcast();
   });
@@ -329,7 +345,7 @@ async function main() {
   console.log(`[Descoberta] Anunciando presença na rede local (UDP Broadcast porta 5005).`);
 
   // Intervalos de Telemetria (Ping / Pong e PPS)
-  setInterval(() => {
+  const pingInterval = setInterval(() => {
     const now = Date.now();
     for (const c of clients.values()) {
       if (c.authenticated && !c.socket.destroyed) {
@@ -340,7 +356,7 @@ async function main() {
     }
   }, 2000);
 
-  setInterval(() => {
+  const statsInterval = setInterval(() => {
     for (const c of clients.values()) {
       c.packetsSec = c.packetCount;
       c.packetCount = 0;
@@ -398,6 +414,13 @@ async function main() {
     const reader = new FrameReader(
       (packet) => {
         if (!session.authenticated) {
+          if (packet.type === 'client_info') {
+            session.screenWidth = Number(packet.width) || session.screenWidth;
+            session.screenHeight = Number(packet.height) || session.screenHeight;
+            if (packet.name) session.name = packet.name;
+            if (packet.id) session.pendingId = packet.id;
+            return;
+          }
           if (packet.type === 'auth_response') {
             const valid = verifyHmac(SECRET_KEY, session.authNonce, packet.hmac);
             if (valid) {
@@ -407,7 +430,21 @@ async function main() {
                 session.authTimer = null;
               }
               if (packet.clientName) session.name = packet.clientName;
-              if (packet.clientId) session.id = packet.clientId;
+              const finalId = packet.clientId || session.pendingId || session.id;
+              if (finalId !== session.id) {
+                const ghost = clients.get(finalId);
+                if (ghost && ghost !== session) {
+                  // Preserva borda da sessão anterior se reconectando com o mesmo ID
+                  session.edge = ghost.edge;
+                  ghost.batcher.cancel();
+                  if (ghost.authTimer) clearTimeout(ghost.authTimer);
+                  clients.delete(finalId);
+                  if (!ghost.socket.destroyed) ghost.socket.destroy();
+                }
+                clients.delete(session.id);
+                session.id = finalId;
+                clients.set(session.id, session);
+              }
 
               console.log(`[Segurança] Cliente "${session.name}" autenticado com sucesso via HMAC-SHA256!`);
               addEvent(`Cliente "${session.name}" autenticado com sucesso [Borda: ${session.edge.toUpperCase()}]`);
@@ -427,13 +464,16 @@ async function main() {
 
         // Cliente autenticado - processa pacotes
         if (packet.type === 'pong') {
-          session.rttMs = Math.max(0, Date.now() - packet.timestamp);
+          session.rttMs = Math.max(0, Math.round(Date.now() - packet.timestamp));
         } else if (packet.type === 'return' || packet.type === 'client_return') {
           backToServer(Number(packet.yRatio ?? 0.5), `borda de "${session.name}"`, session.edge);
         } else if (packet.type === 'client_enter') {
           if (activeClientId) {
             const prev = getActiveClient();
-            if (prev) sendToClient(prev, { type: 'leave' });
+            if (prev) {
+              prev.batcher.cancel();
+              sendToClient(prev, { type: 'leave' });
+            }
             activeClientId = null;
             capture.setRemote(false, 0.5);
           }
@@ -456,6 +496,7 @@ async function main() {
           packet.type === 'key'
         ) {
           if (controllingClientId === session.id) {
+            session.packetCount++;
             capture.injectFromClient(packet);
           }
         } else if (packet.type === 'clipboard') {
@@ -493,13 +534,20 @@ async function main() {
 
     socket.on('close', () => {
       if (session.authTimer) clearTimeout(session.authTimer);
-      clients.delete(clientKey);
+      session.batcher.cancel();
 
-      if (controllingClientId === session.id) {
+      if (clients.get(session.id) === session) {
+        clients.delete(session.id);
+      }
+      if (clients.get(clientKey) === session) {
+        clients.delete(clientKey);
+      }
+
+      if (controllingClientId === session.id && !clients.has(session.id)) {
         controllingClientId = null;
         capture.clientLeave();
       }
-      if (activeClientId === session.id) {
+      if (activeClientId === session.id && !clients.has(session.id)) {
         backToServer(0.5, `cliente "${session.name}" desconectou`, session.edge);
       }
       console.log(`[Servidor] Cliente desconectado: ${session.name}`);
@@ -520,7 +568,11 @@ async function main() {
   });
 
   const shutdown = () => {
+    clearInterval(pingInterval);
+    clearInterval(statsInterval);
     discoveryServer.stop();
+    dashboard.stop();
+    server.close();
     capture.stop();
     process.exit(0);
   };

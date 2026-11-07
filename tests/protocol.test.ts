@@ -48,9 +48,10 @@ test('Protocol: Binary encoding and decoding of BUTTON, KEY and WHEEL', () => {
   assert.deepEqual(receivedList, packets);
 });
 
-test('Protocol: Binary encoding of PING / PONG and CLIENT_POS', () => {
-  const ping: Packet = { type: 'ping', seq: 42, timestamp: 123456789 };
-  const pong: Packet = { type: 'pong', seq: 42, timestamp: 123456789 };
+test('Protocol: Binary encoding of PING / PONG (64-bit timestamp) and CLIENT_POS', () => {
+  const realTimestamp = 1794082000123; // > 2^32 (testa prevenção de truncamento 32-bit)
+  const ping: Packet = { type: 'ping', seq: 42, timestamp: realTimestamp };
+  const pong: Packet = { type: 'pong', seq: 42, timestamp: realTimestamp };
   const pos: Packet = { type: 'client_pos', x: 500, y: 300 };
 
   const receivedList: Packet[] = [];
@@ -118,6 +119,12 @@ test('Protocol: MouseBatcher coalesces rapid mouse moves', async () => {
   assert.equal(flushedCount, 1, 'Eventos agrupados devem disparar apenas 1 pacote combinado');
   assert.equal(totalDx, 20);
   assert.equal(totalDy, -10);
+
+  // Testa cancelamento de lote pendente
+  batcher.push(15, 15);
+  batcher.cancel();
+  batcher.flush();
+  assert.equal(flushedCount, 1, 'Lote cancelado não deve emitir pacotes');
 });
 
 test('Security: HMAC-SHA256 handshake challenge and response', () => {

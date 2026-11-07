@@ -62,6 +62,8 @@ def ev(t, c, v):
 class LinuxClipboard:
     """Sincroniza texto e imagens da área de transferência do Linux com fallback: GTK3 -> wl-clipboard -> xclip."""
 
+    MAX_IMAGE_BYTES = 8 * 1024 * 1024  # 8MB limite seguro
+
     def __init__(self):
         self.backend = None
         self.last_text = ""
@@ -69,7 +71,7 @@ class LinuxClipboard:
         self.cb = None
         self.GLib = None
 
-        # 1. Tenta GTK3 (GDK X11/XWayland)
+        # 1. Tenta GTK3 (GDK X11/XWayland) orientado a eventos (owner-change)
         try:
             os.environ["GDK_BACKEND"] = "x11"
             import gi
@@ -81,7 +83,7 @@ class LinuxClipboard:
             self.GLib = GLib
             self.cb = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
             self.backend = "gtk"
-            GLib.timeout_add(400, self._poll_gtk)
+            self.cb.connect("owner-change", self._on_gtk_owner_change)
             t = threading.Thread(target=Gtk.main, daemon=True)
             t.start()
             log("Clipboard backend ativo: GTK3")
@@ -105,13 +107,16 @@ class LinuxClipboard:
         if not self.backend:
             log("Nenhum backend de clipboard disponível. Instale wl-clipboard, xclip ou python3-gi.")
 
+    def _on_gtk_owner_change(self, *_args):
+        self._poll_gtk()
+
     def _poll_gtk(self):
         try:
             self.cb.request_text(self._on_gtk_text)
             self.cb.request_image(self._on_gtk_image)
         except Exception:
             pass
-        return True
+        return False
 
     def _on_gtk_text(self, _clipboard, text):
         if text and text != self.last_text:
@@ -123,7 +128,7 @@ class LinuxClipboard:
             return
         try:
             success, png_bytes = pixbuf.save_to_bufferv("png", [], [])
-            if success and png_bytes:
+            if success and png_bytes and len(png_bytes) <= self.MAX_IMAGE_BYTES:
                 h = hashlib.md5(png_bytes).hexdigest()
                 if h != self.last_img_hash:
                     self.last_img_hash = h
@@ -134,11 +139,24 @@ class LinuxClipboard:
 
     def _poll_cli_loop(self):
         while True:
-            time.sleep(0.5)
+            time.sleep(1.5)
             self._check_cli_clipboard()
 
     def _check_cli_clipboard(self):
         try:
+            # Checa tipos disponíveis primeiro no Wayland para evitar leituras desnecessárias
+            if self.backend == "wayland":
+                res_types = subprocess.run(
+                    ["wl-paste", "--list-types"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    timeout=1,
+                )
+                types_out = res_types.stdout.decode("utf-8", errors="ignore") if res_types.returncode == 0 else ""
+                has_image = "image/png" in types_out
+            else:
+                has_image = True
+
             # Checa texto
             cmd_text = ["wl-paste", "-n"] if self.backend == "wayland" else ["xclip", "-selection", "clipboard", "-o"]
             res = subprocess.run(cmd_text, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=1)
@@ -149,10 +167,12 @@ class LinuxClipboard:
                     send({"type": "clipboard", "format": "text", "text": text})
                     return
 
-            # Checa imagem se texto não mudou
+            # Checa imagem se houver suporte/tipo disponível
+            if not has_image:
+                return
             cmd_img = ["wl-paste", "-t", "image/png"] if self.backend == "wayland" else ["xclip", "-selection", "clipboard", "-t", "image/png", "-o"]
             res_img = subprocess.run(cmd_img, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=1)
-            if res_img.returncode == 0 and res_img.stdout:
+            if res_img.returncode == 0 and res_img.stdout and len(res_img.stdout) <= self.MAX_IMAGE_BYTES:
                 img_data = res_img.stdout
                 h = hashlib.md5(img_data).hexdigest()
                 if h != self.last_img_hash:
@@ -256,7 +276,16 @@ def list_devices():
 
         is_mouse = any(h.startswith("mouse") for h in handlers) and (evbits & (1 << EV_REL)) != 0
         is_joystick = any(h.startswith("js") for h in handlers)
-        is_keyboard = "kbd" in handlers and (evbits & 0x120013) == 0x120013 and not is_joystick
+        is_power = "Power Button" in name or "Sleep Button" in name
+        is_control = "System Control" in name or "Consumer Control" in name
+        is_keyboard = (
+            "kbd" in handlers
+            and (evbits & (1 << EV_KEY)) != 0
+            and not is_joystick
+            and not is_mouse
+            and not is_power
+            and not is_control
+        )
 
         if is_mouse:
             mice.append(path)
@@ -370,6 +399,7 @@ class Capture:
 
         self.remote = False  # True quando mouse/teclado do Servidor controla o Cliente
         self.client_controlling = False  # True quando mouse/teclado do Cliente está na tela do Servidor
+        self.client_edge = None
         self.edge_notified = False
         self.last_crossed_edge = None
         self.x = self.width // 2
@@ -407,7 +437,10 @@ class Capture:
                 log("Não foi possível abrir mouse %s: %s" % (path, e))
 
         if not self.mouse_fds:
-            raise RuntimeError("Nenhum mouse pôde ser aberto (verifique permissões em /dev/input)")
+            raise RuntimeError(
+                "Nenhum mouse pôde ser aberto em /dev/input (Permissão Negada). "
+                "Execute no terminal: sudo setfacl -m u:$USER:rw %s /dev/uinput" % " ".join(mice)
+            )
 
         for path in keyboards:
             try:
@@ -442,12 +475,39 @@ class Capture:
             self.vinput.close()
             self.vinput = None
 
+    def rescan_devices(self):
+        mice, keyboards = list_devices()
+        known_mice = set(self.mouse_fds.values())
+        known_kbds = set(self.kbd_fds.values())
+        for path in mice:
+            if path not in known_mice:
+                try:
+                    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+                    self.mouse_fds[fd] = path
+                    self.motion[fd] = [0, 0]
+                    if self.remote:
+                        fcntl.ioctl(fd, EVIOCGRAB, 1)
+                    log("Mouse reconectado: %s" % path)
+                except OSError:
+                    pass
+        for path in keyboards:
+            if path not in known_kbds:
+                try:
+                    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+                    self.kbd_fds[fd] = path
+                    if self.remote:
+                        fcntl.ioctl(fd, EVIOCGRAB, 1)
+                    log("Teclado reconectado: %s" % path)
+                except OSError:
+                    pass
+
     def run(self):
         stdin_fd = sys.stdin.fileno()
         os.set_blocking(stdin_fd, False)
+        last_rescan = time.monotonic()
         while True:
             fds = list(self.mouse_fds) + list(self.kbd_fds) + [stdin_fd]
-            readable, _, _ = select.select(fds, [], [])
+            readable, _, _ = select.select(fds, [], [], 2.0)
             for fd in readable:
                 if fd == stdin_fd:
                     if not self.read_stdin(fd):
@@ -456,6 +516,10 @@ class Capture:
                     self.read_mouse(fd)
                 elif fd in self.kbd_fds:
                     self.read_keyboard(fd)
+            now = time.monotonic()
+            if now - last_rescan >= 3.0:
+                last_rescan = now
+                self.rescan_devices()
 
     def read_events(self, fd, table):
         try:
@@ -531,6 +595,7 @@ class Capture:
         r = min(max(float(ratio if ratio is not None else 0.5), 0.0), 1.0)
         offset = 50
         target_edge = edge if edge else self.edge
+        self.client_edge = target_edge
         if target_edge == "right":
             self.x = max(0, self.width - offset)
             self.y = int(r * (self.height - 1))
@@ -548,6 +613,7 @@ class Capture:
 
     def on_client_leave(self):
         self.client_controlling = False
+        self.client_edge = None
         if self.vinput:
             self.vinput.release_all()
 
@@ -564,21 +630,23 @@ class Capture:
         if now >= self.cooldown_until:
             hit = False
             ratio = 0.5
-            if self.edge == "right" and nx >= self.width - 1 and dx > 0:
+            active_edge = self.client_edge or self.edge
+            if active_edge == "right" and nx >= self.width - 1 and dx > 0:
                 hit = True
                 ratio = min(max(ny, 0), self.height - 1) / float(max(1, self.height - 1))
-            elif self.edge == "left" and nx <= 0 and dx < 0:
+            elif active_edge == "left" and nx <= 0 and dx < 0:
                 hit = True
                 ratio = min(max(ny, 0), self.height - 1) / float(max(1, self.height - 1))
-            elif self.edge == "top" and ny <= 0 and dy < 0:
+            elif active_edge == "top" and ny <= 0 and dy < 0:
                 hit = True
                 ratio = min(max(nx, 0), self.width - 1) / float(max(1, self.width - 1))
-            elif self.edge == "bottom" and ny >= self.height - 1 and dy > 0:
+            elif active_edge == "bottom" and ny >= self.height - 1 and dy > 0:
                 hit = True
                 ratio = min(max(nx, 0), self.width - 1) / float(max(1, self.width - 1))
 
             if hit:
                 self.client_controlling = False
+                self.client_edge = None
                 if self.vinput:
                     self.vinput.release_all()
                 self.cooldown_until = now + 0.35
@@ -681,10 +749,15 @@ class Capture:
                 self.edge_notified = True
                 self.last_crossed_edge = crossed_edge
                 send({"type": "edge", "edge": crossed_edge, "yRatio": round(ratio, 4)})
-        else:
+        elif self.edge_notified:
             margin = 20
-            if (self.x > margin and self.x < self.width - margin and
-                self.y > margin and self.y < self.height - margin):
+            moved_away = (
+                (self.last_crossed_edge == "right" and self.x < self.width - margin)
+                or (self.last_crossed_edge == "left" and self.x > margin)
+                or (self.last_crossed_edge == "top" and self.y > margin)
+                or (self.last_crossed_edge == "bottom" and self.y < self.height - margin)
+            )
+            if moved_away:
                 self.edge_notified = False
                 self.last_crossed_edge = None
 
@@ -744,6 +817,7 @@ class Capture:
             self.frac_x = self.frac_y = 0.0
             send({"type": "pos", "x": self.x, "y": self.y})
         self.edge_notified = False
+        self.last_crossed_edge = None
 
 
 def main():

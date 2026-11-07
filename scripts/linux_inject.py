@@ -3,10 +3,13 @@
 Injetor de mouse/teclado do CLIENTE KVM no Linux (Wayland e X11) via /dev/uinput.
 Suporta bordas left, right, top, bottom, cooldown anti-ping-pong e telemetria p <x> <y>.
 """
+import base64
 import fcntl
 import json
 import os
+import shutil
 import struct
+import subprocess
 import sys
 import time
 
@@ -98,8 +101,8 @@ def main():
             cmd = p[0]
             if cmd == "c":
                 return_edge = p[1].strip().lower()
-            elif cmd == "e":
-                active = True
+            elif cmd in ("e", "cr"):
+                active = cmd == "e"
                 r = min(max(float(p[1]), 0.0), 1.0)
                 offset = 40
                 if return_edge == "left":
@@ -116,6 +119,30 @@ def main():
             elif cmd == "l":
                 active = False
                 release_all()
+            elif cmd == "cb":
+                if len(p) > 1:
+                    try:
+                        text = base64.b64decode(p[1].strip()).decode("utf-8", errors="replace")
+                        if shutil.which("wl-copy"):
+                            p_cp = subprocess.Popen(["wl-copy"], stdin=subprocess.PIPE)
+                            p_cp.communicate(text.encode("utf-8"), timeout=2)
+                        elif shutil.which("xclip"):
+                            p_cp = subprocess.Popen(["xclip", "-selection", "clipboard"], stdin=subprocess.PIPE)
+                            p_cp.communicate(text.encode("utf-8"), timeout=2)
+                    except Exception:
+                        pass
+            elif cmd == "cb_img":
+                if len(p) > 1:
+                    try:
+                        png_bytes = base64.b64decode(p[1].strip())
+                        if shutil.which("wl-copy"):
+                            p_cp = subprocess.Popen(["wl-copy", "-t", "image/png"], stdin=subprocess.PIPE)
+                            p_cp.communicate(png_bytes, timeout=2)
+                        elif shutil.which("xclip"):
+                            p_cp = subprocess.Popen(["xclip", "-selection", "clipboard", "-t", "image/png"], stdin=subprocess.PIPE)
+                            p_cp.communicate(png_bytes, timeout=2)
+                    except Exception:
+                        pass
             elif not active:
                 continue
             elif cmd == "m":

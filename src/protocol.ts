@@ -88,17 +88,17 @@ export function encodeBinary(packet: Packet): Buffer {
       return buf;
     }
     case 'ping': {
-      const buf = Buffer.allocUnsafe(9);
+      const buf = Buffer.allocUnsafe(13);
       buf.writeUInt8(OP_PING, 0);
       buf.writeUInt32BE(packet.seq >>> 0, 1);
-      buf.writeUInt32BE(packet.timestamp >>> 0, 5);
+      buf.writeDoubleBE(packet.timestamp, 5);
       return buf;
     }
     case 'pong': {
-      const buf = Buffer.allocUnsafe(9);
+      const buf = Buffer.allocUnsafe(13);
       buf.writeUInt8(OP_PONG, 0);
       buf.writeUInt32BE(packet.seq >>> 0, 1);
-      buf.writeUInt32BE(packet.timestamp >>> 0, 5);
+      buf.writeDoubleBE(packet.timestamp, 5);
       return buf;
     }
     case 'client_pos': {
@@ -127,12 +127,14 @@ export function encode(packet: Packet): string {
   return JSON.stringify(packet) + '\n';
 }
 
+const EMPTY_BUFFER = Buffer.alloc(0);
+
 /**
  * FrameReader avançado que processa tanto pacotes binários quanto NDJSON legado,
- * com proteção contra estouro de buffer (DoS / memory leak).
+ * com proteção contra estouro de buffer (DoS / memory leak) e leitura por offset.
  */
 export class FrameReader {
-  private buffer: Buffer = Buffer.alloc(0);
+  private buffer: Buffer = EMPTY_BUFFER;
   private readonly maxBufferSize: number;
 
   constructor(
@@ -144,28 +146,45 @@ export class FrameReader {
 
   push(chunk: Buffer | string): void {
     const chunkBuf = typeof chunk === 'string' ? Buffer.from(chunk, 'utf8') : chunk;
+    if (chunkBuf.length === 0) return;
+
     if (this.buffer.length + chunkBuf.length > this.maxBufferSize) {
-      this.buffer = Buffer.alloc(0);
+      this.buffer = EMPTY_BUFFER;
       throw new Error(`Buffer overflow: excedeu ${this.maxBufferSize} bytes sem delimitador válido.`);
     }
 
-    this.buffer = Buffer.concat([this.buffer, chunkBuf]);
+    this.buffer = this.buffer.length === 0 ? chunkBuf : Buffer.concat([this.buffer, chunkBuf]);
     this.process();
   }
 
+  private compact(offset: number): void {
+    if (offset <= 0) return;
+    if (offset >= this.buffer.length) {
+      this.buffer = EMPTY_BUFFER;
+    } else {
+      // Copia apenas o restante pendente para liberar o ArrayBuffer antigo do GC
+      this.buffer = Buffer.from(this.buffer.subarray(offset));
+    }
+  }
+
   private process(): void {
-    while (this.buffer.length > 0) {
-      const firstByte = this.buffer[0];
+    let offset = 0;
+    const buf = this.buffer;
+    const totalLen = buf.length;
+
+    while (offset < totalLen) {
+      const remaining = totalLen - offset;
+      const firstByte = buf[offset];
 
       // Caso 1: Pacote NDJSON em texto (começa com '{' ou espaço/newline)
       if (firstByte === 0x7b || firstByte === 0x0a || firstByte === 0x0d || firstByte === 0x20) {
-        const newlineIdx = this.buffer.indexOf(0x0a);
+        const newlineIdx = buf.indexOf(0x0a, offset);
         if (newlineIdx === -1) {
           // Linha ainda incompleta
           break;
         }
-        const line = this.buffer.subarray(0, newlineIdx).toString('utf8').trim();
-        this.buffer = this.buffer.subarray(newlineIdx + 1);
+        const line = buf.subarray(offset, newlineIdx).toString('utf8').trim();
+        offset = newlineIdx + 1;
         if (line) {
           try {
             const parsed = JSON.parse(line) as Packet;
@@ -180,70 +199,98 @@ export class FrameReader {
       // Caso 2: Pacote Binário por Opcode
       switch (firstByte) {
         case OP_MOVE: {
-          if (this.buffer.length < 5) return;
-          const dx = this.buffer.readInt16BE(1);
-          const dy = this.buffer.readInt16BE(3);
-          this.buffer = this.buffer.subarray(5);
+          if (remaining < 5) {
+            this.compact(offset);
+            return;
+          }
+          const dx = buf.readInt16BE(offset + 1);
+          const dy = buf.readInt16BE(offset + 3);
+          offset += 5;
           this.onPacket({ type: 'move', dx, dy });
           break;
         }
         case OP_BUTTON: {
-          if (this.buffer.length < 3) return;
-          const button = this.buffer.readUInt8(1);
-          const down = this.buffer.readUInt8(2) === 1;
-          this.buffer = this.buffer.subarray(3);
+          if (remaining < 3) {
+            this.compact(offset);
+            return;
+          }
+          const button = buf.readUInt8(offset + 1);
+          const down = buf.readUInt8(offset + 2) === 1;
+          offset += 3;
           this.onPacket({ type: 'button', button, down });
           break;
         }
         case OP_KEY: {
-          if (this.buffer.length < 4) return;
-          const code = this.buffer.readUInt16BE(1);
-          const down = this.buffer.readUInt8(3) === 1;
-          this.buffer = this.buffer.subarray(4);
+          if (remaining < 4) {
+            this.compact(offset);
+            return;
+          }
+          const code = buf.readUInt16BE(offset + 1);
+          const down = buf.readUInt8(offset + 3) === 1;
+          offset += 4;
           this.onPacket({ type: 'key', code, down });
           break;
         }
         case OP_WHEEL: {
-          if (this.buffer.length < 5) return;
-          const dy = this.buffer.readInt16BE(1);
-          const dx = this.buffer.readInt16BE(3);
-          this.buffer = this.buffer.subarray(5);
+          if (remaining < 5) {
+            this.compact(offset);
+            return;
+          }
+          const dy = buf.readInt16BE(offset + 1);
+          const dx = buf.readInt16BE(offset + 3);
+          offset += 5;
           this.onPacket({ type: 'wheel', dy, dx });
           break;
         }
         case OP_PING: {
-          if (this.buffer.length < 9) return;
-          const seq = this.buffer.readUInt32BE(1);
-          const timestamp = this.buffer.readUInt32BE(5);
-          this.buffer = this.buffer.subarray(9);
+          if (remaining < 13) {
+            this.compact(offset);
+            return;
+          }
+          const seq = buf.readUInt32BE(offset + 1);
+          const timestamp = buf.readDoubleBE(offset + 5);
+          offset += 13;
           this.onPacket({ type: 'ping', seq, timestamp });
           break;
         }
         case OP_PONG: {
-          if (this.buffer.length < 9) return;
-          const seq = this.buffer.readUInt32BE(1);
-          const timestamp = this.buffer.readUInt32BE(5);
-          this.buffer = this.buffer.subarray(9);
+          if (remaining < 13) {
+            this.compact(offset);
+            return;
+          }
+          const seq = buf.readUInt32BE(offset + 1);
+          const timestamp = buf.readDoubleBE(offset + 5);
+          offset += 13;
           this.onPacket({ type: 'pong', seq, timestamp });
           break;
         }
         case OP_POS: {
-          if (this.buffer.length < 5) return;
-          const x = this.buffer.readInt16BE(1);
-          const y = this.buffer.readInt16BE(3);
-          this.buffer = this.buffer.subarray(5);
+          if (remaining < 5) {
+            this.compact(offset);
+            return;
+          }
+          const x = buf.readInt16BE(offset + 1);
+          const y = buf.readInt16BE(offset + 3);
+          offset += 5;
           this.onPacket({ type: 'client_pos', x, y });
           break;
         }
         case OP_JSON: {
-          if (this.buffer.length < 5) return;
-          const len = this.buffer.readUInt32BE(1);
+          if (remaining < 5) {
+            this.compact(offset);
+            return;
+          }
+          const len = buf.readUInt32BE(offset + 1);
           if (len > this.maxBufferSize) {
+            this.buffer = EMPTY_BUFFER;
             throw new Error(`Pacote JSON payload de ${len} bytes excede limite de segurança.`);
           }
-          if (this.buffer.length < 5 + len) return;
-          const jsonStr = this.buffer.subarray(5, 5 + len).toString('utf8');
-          this.buffer = this.buffer.subarray(5 + len);
+          if (remaining < 5 + len) {
+            this.compact(offset);
+            return;
+          }
+          const jsonStr = buf.subarray(offset + 5, offset + 5 + len).toString('utf8');
+          offset += 5 + len;
           try {
             const parsed = JSON.parse(jsonStr) as Packet;
             this.onPacket(parsed);
@@ -254,11 +301,13 @@ export class FrameReader {
         }
         default: {
           // Byte desconhecido - consome 1 byte para tentar ressincronizar
-          this.buffer = this.buffer.subarray(1);
+          offset += 1;
           break;
         }
       }
     }
+
+    this.compact(offset);
   }
 }
 
@@ -311,6 +360,7 @@ export class MouseBatcher {
 
     if (!this.timer) {
       this.timer = setTimeout(() => this.flush(), this.batchIntervalMs);
+      this.timer.unref?.();
     }
   }
 
@@ -328,6 +378,15 @@ export class MouseBatcher {
       this.onFlush(dx, dy);
     }
   }
+
+  cancel(): void {
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
+    this.pendingDx = 0;
+    this.pendingDy = 0;
+  }
 }
 
 /**
@@ -342,7 +401,8 @@ export function computeHmac(secretKey: string, nonce: string): string {
 }
 
 export function verifyHmac(secretKey: string, nonce: string, providedHmac: string): boolean {
-  if (!providedHmac || typeof providedHmac !== 'string') return false;
+  if (!providedHmac || typeof providedHmac !== 'string' || providedHmac.length % 2 !== 0) return false;
+  if (!/^[0-9a-fA-F]+$/.test(providedHmac)) return false;
   const expected = computeHmac(secretKey, nonce);
   const bufExpected = Buffer.from(expected, 'hex');
   const bufProvided = Buffer.from(providedHmac, 'hex');
@@ -383,6 +443,10 @@ export function loadEnv(): void {
  * Salva/atualiza chaves no arquivo .env na raiz do projeto
  */
 export function saveEnv(updates: Record<string, string | number>): void {
+  for (const [k, v] of Object.entries(updates)) {
+    process.env[k] = String(v);
+  }
+
   const envPath = path.resolve(process.cwd(), '.env');
   let lines: string[] = [];
   if (fs.existsSync(envPath)) {

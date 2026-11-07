@@ -26,53 +26,62 @@ export class Injector extends EventEmitter {
       this.proc = proc;
       let ready = false;
 
-      const reader = new LineReader((line) => {
-        if (line.startsWith('ready')) {
-          ready = true;
-          const dims = line.slice(6).trim().split('x');
-          if (dims.length === 2) {
-            this.screenWidth = Number(dims[0]) || 1920;
-            this.screenHeight = Number(dims[1]) || 1080;
+      const reader = new LineReader(
+        (line) => {
+          if (line.startsWith('ready')) {
+            ready = true;
+            const dims = line.slice(6).trim().split('x');
+            if (dims.length === 2) {
+              this.screenWidth = Number(dims[0]) || 1920;
+              this.screenHeight = Number(dims[1]) || 1080;
+            }
+            console.log(`[Injetor ${this.label}] Pronto (tela ${this.screenWidth}x${this.screenHeight})`);
+            resolve({ width: this.screenWidth, height: this.screenHeight });
+          } else if (line.startsWith('r ')) {
+            this.emit('return', Number(line.slice(2)));
+          } else if (line.startsWith('p ')) {
+            const parts = line.slice(2).trim().split(' ');
+            if (parts.length >= 2) {
+              this.emit('pos', { x: Number(parts[0]), y: Number(parts[1]) });
+            }
+          } else if (line.startsWith('cb ')) {
+            try {
+              const text = Buffer.from(line.slice(3).trim(), 'base64').toString('utf8');
+              if (text) this.emit('clipboard', { type: 'clipboard', format: 'text', text });
+            } catch {
+              // ignore
+            }
+          } else if (line.startsWith('cb_img ')) {
+            const imgB64 = line.slice(7).trim();
+            if (imgB64) this.emit('clipboard', { type: 'clipboard', format: 'image', image: imgB64 });
+          } else if (line.startsWith('cs_e ')) {
+            this.emit('client_enter', Number(line.slice(5)));
+          } else if (line === 'cs_l') {
+            this.emit('client_leave');
+          } else if (line.startsWith('cs_m ')) {
+            const p = line.slice(5).trim().split(' ');
+            this.emit('client_input', { type: 'move', dx: Number(p[0]), dy: Number(p[1]) });
+          } else if (line.startsWith('cs_b ')) {
+            const p = line.slice(5).trim().split(' ');
+            this.emit('client_input', { type: 'button', button: Number(p[0]), down: p[1] === '1' });
+          } else if (line.startsWith('cs_w ')) {
+            const p = line.slice(5).trim().split(' ');
+            this.emit('client_input', { type: 'wheel', dy: Number(p[0]), dx: Number(p[1]) });
+          } else if (line.startsWith('cs_k ')) {
+            const p = line.slice(5).trim().split(' ');
+            this.emit('client_input', { type: 'key', code: Number(p[0]), down: p[1] === '1' });
           }
-          console.log(`[Injetor ${this.label}] Pronto (tela ${this.screenWidth}x${this.screenHeight})`);
-          resolve({ width: this.screenWidth, height: this.screenHeight });
-        } else if (line.startsWith('r ')) {
-          this.emit('return', Number(line.slice(2)));
-        } else if (line.startsWith('p ')) {
-          const parts = line.slice(2).trim().split(' ');
-          if (parts.length >= 2) {
-            this.emit('pos', { x: Number(parts[0]), y: Number(parts[1]) });
-          }
-        } else if (line.startsWith('cb ')) {
-          try {
-            const text = Buffer.from(line.slice(3).trim(), 'base64').toString('utf8');
-            if (text) this.emit('clipboard', { type: 'clipboard', format: 'text', text });
-          } catch {
-            // ignore
-          }
-        } else if (line.startsWith('cb_img ')) {
-          const imgB64 = line.slice(7).trim();
-          if (imgB64) this.emit('clipboard', { type: 'clipboard', format: 'image', image: imgB64 });
-        } else if (line.startsWith('cs_e ')) {
-          this.emit('client_enter', Number(line.slice(5)));
-        } else if (line === 'cs_l') {
-          this.emit('client_leave');
-        } else if (line.startsWith('cs_m ')) {
-          const p = line.slice(5).trim().split(' ');
-          this.emit('client_input', { type: 'move', dx: Number(p[0]), dy: Number(p[1]) });
-        } else if (line.startsWith('cs_b ')) {
-          const p = line.slice(5).trim().split(' ');
-          this.emit('client_input', { type: 'button', button: Number(p[0]), down: p[1] === '1' });
-        } else if (line.startsWith('cs_w ')) {
-          const p = line.slice(5).trim().split(' ');
-          this.emit('client_input', { type: 'wheel', dy: Number(p[0]), dx: Number(p[1]) });
-        } else if (line.startsWith('cs_k ')) {
-          const p = line.slice(5).trim().split(' ');
-          this.emit('client_input', { type: 'key', code: Number(p[0]), down: p[1] === '1' });
+        },
+        { maxLineLength: 10 * 1024 * 1024 }
+      );
+
+      proc.stdout!.on('data', (chunk) => {
+        try {
+          reader.push(chunk);
+        } catch (err) {
+          console.warn(`[Injetor ${this.label}] Aviso no LineReader:`, (err as Error).message);
         }
       });
-
-      proc.stdout!.on('data', (chunk) => reader.push(chunk));
       proc.on('error', (err) => {
         if (!ready) reject(err);
       });
@@ -85,7 +94,10 @@ export class Injector extends EventEmitter {
   }
 
   private write(line: string) {
-    this.proc?.stdin?.write(line + '\n');
+    const stdin = this.proc?.stdin;
+    if (stdin && !stdin.destroyed && stdin.writable) {
+      stdin.write(line + '\n');
+    }
   }
 
   setReturnEdge(edge: Edge) {
